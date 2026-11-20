@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""PANDI crawler progress bot: read-only SQLite, on-demand Telegram commands.
-
-Requires only Python 3.9+ stdlib. Never modifies crawler jobs or sends BIMA alerts.
-"""
+"""Telegram monitoring and on-demand checks."""
+from telegram_checks import normalize_input_url, request_check
 import json
 from contextlib import closing
 import logging
@@ -12,7 +10,7 @@ import sqlite3
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger("pandi.telegram.monitor")
@@ -194,7 +192,8 @@ def recent_report(connection, limit=5):
 
 
 HELP = (
-    "PANDI Crawler Monitor (hanya baca)\n"
+    "PANDI Crawler Monitor\n"
+    "/cek <URL .id> - periksa halaman dan kirim hasil ke chat ini\n"
     "/status - total URL, progres dan antrean\n"
     "/inconclusive - alasan dan contoh gagal analisis\n"
     "/dns - ringkasan retry DNS/HTTP\n"
@@ -206,13 +205,24 @@ HELP = (
 )
 
 
-def handle_command(text, chat_id, allowed, db_path):
+def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=None):
     parts = text.strip().split()
     command = (parts[0] if parts else '').split('@')[0].lower()
     if command in ('/id', '/start'):
         return f"Chat ID Anda: {chat_id}\nBerikan ID ini kepada admin bot untuk diizinkan."
     if chat_id not in allowed:
         return "Chat ini belum diizinkan. Kirim /id lalu daftarkan ID ke administrator."
+    if command == '/cek':
+        if os.environ.get('TELEGRAM_CHECKS_ENABLED') != '1':
+            return 'Fitur /cek belum diaktifkan.'
+        if chat_id.startswith('-') and sender_id not in {
+                v.strip() for v in os.environ.get('TELEGRAM_CHECK_USER_IDS', '').split(',') if v.strip()}:
+            return 'Pengirim belum diizinkan memakai /cek di grup ini.'
+        url = normalize_input_url(parts[1]) if len(parts) == 2 else None
+        if not url or '@' in urlsplit(url).netloc or chr(92) in url:
+            return 'Gunakan /cek https://domain.id/path dengan URL .id yang valid.'
+        check_id = request_check(db_path, url, chat_id, update_id)
+        return f'Permintaan #{check_id} diterima. Hasil akan dikirim ke chat ini.'
     if command in ('/help', ''):
         return HELP
     if command not in ('/status','/inconclusive','/dns','/bima','/now','/recent'):
@@ -287,6 +297,27 @@ def send_message(token, chat_id, text):
     return result.get('result')
 
 
+def deliver_checks(token, db_path, allowed):
+    with closing(sqlite3.connect(Path(db_path).resolve().as_uri()+'?mode=rw', uri=True)) as conn:
+        rows = conn.execute("""SELECT t.id,t.chat_id,j.url,t.result,t.risk,t.reason,t.checked_at
+            FROM telegram_checks t JOIN jobs j ON j.id=t.job_id
+            WHERE t.delivered=0 AND t.result IS NOT NULL ORDER BY t.id LIMIT 20""").fetchall()
+        for number, chat, url, status, risk, reason, checked in rows:
+            if chat in allowed:
+                label = status_label(status, risk, reason)
+                if status == 'retry_http':
+                    label = 'Belum dapat disimpulkan. ' + label
+                message = f'#{number} {safe_domain(url)}\n{label}\n{reason or "-"}\n{checked or "-"} UTC'
+                try:
+                    send_message(token, chat, message)
+                except HTTPError as error:
+                    if error.code not in (400, 403):
+                        raise
+                    LOGGER.warning('Telegram menolak hasil #%d (HTTP %d)', number, error.code)
+            with conn:
+                conn.execute('UPDATE telegram_checks SET delivered=1 WHERE id=?', (number,))
+
+
 def safe_network_error(error):
     """No URL, path or Telegram token must appear in systemd logs."""
     if isinstance(error, HTTPError):
@@ -320,7 +351,7 @@ def main():
     allowed = {x.strip() for x in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
     db_path = os.environ.get("CRAWLER_DB_PATH", DB_DEFAULT)
     offset_path = os.environ.get("TELEGRAM_OFFSET_PATH", OFFSET_DEFAULT)
-    LOGGER.info("PANDI monitoring bot aktif (hanya baca). Allowed chats: %s", len(allowed))
+    LOGGER.info("PANDI monitoring bot aktif. Allowed chats: %s", len(allowed))
     if not allowed:
         LOGGER.warning("Belum ada chat yang diizinkan; hanya /id dan /start yang dijawab")
     offset = load_offset(offset_path)
@@ -350,7 +381,8 @@ def main():
                 command = message.get("text", "")
                 if chat_id and isinstance(command, str) and command.startswith("/"):
                     try:
-                        reply = handle_command(command, chat_id, allowed, db_path)
+                        reply = handle_command(command, chat_id, allowed, db_path, update_id,
+                                               str((message.get("from") or {}).get("id", "")))
                     except (sqlite3.Error, OSError) as error:
                         LOGGER.error("Database query failed: %s", type(error).__name__)
                         reply = "Database crawler belum bisa dibaca. Periksa path, izin, dan SQLite."
@@ -358,9 +390,11 @@ def main():
                     LOGGER.info("Telegram command handled: %s", command.split()[0].split('@')[0][:30])
                 offset = max(offset, update_id + 1)
                 save_offset(offset_path, offset)
+            if os.environ.get('TELEGRAM_CHECKS_ENABLED') == '1':
+                deliver_checks(token, db_path, allowed)
             if fallback_short_poll and not updates:
                 time.sleep(3)  # avoid aggressive short polling
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError) as error:
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
             # Never print exception text: urllib exceptions can embed the token URL.
             failures += 1
             LOGGER.warning("Telegram poll/send gagal (%s), consecutive=%d", safe_network_error(error), failures)

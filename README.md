@@ -95,7 +95,7 @@ crawler-rebuild/
 │   ├── chrome_runtime.py
 │   ├── setup_chrome.py
 │   ├── dns_audit.py
-│   ├── telegram_monitor.py       # Bot interaktif, read-only
+│   ├── telegram_monitor.py       # Bot interaktif dan permintaan /cek
 │   ├── telegram_periodic.py      # Pengirim ringkasan tiap 5 menit (paket terpisah)
 │   ├── telegram_monitor.env      # Token/chat ID, rahasia; JANGAN commit
 │   ├── crawler_watchdog.py       # Opsional; bukan komponen wajib
@@ -501,7 +501,17 @@ Status utama: `pending`, `http_inflight`, `retry_http`, `browser_queued`, `compl
 
 ### 9.1 Telegram Monitor interaktif (`pandi-telegram-monitor.service`)
 
-Modul `multi/telegram_monitor.py` berjalan terus-menerus, melakukan **GET polling** ke Telegram Bot API dan membaca database SQLite **read-only**. Ia tidak mengubah status job dan tidak mengirim alert BIMA. **Jangan menjalankan dua proses monitor polling memakai token bot yang sama** karena `getUpdates` dapat saling berebut pembaruan.
+Modul `multi/telegram_monitor.py` berjalan terus-menerus, melakukan **GET polling** ke Telegram Bot API dan membuka laporan SQLite dalam mode baca. Fitur opsional `/cek` menulis permintaan ke antrean. Crawler menangani klasifikasi dan pelaporan BIMA. **Jangan menjalankan dua proses monitor polling memakai token bot yang sama** karena `getUpdates` dapat saling berebut pembaruan.
+
+#### Pemeriksaan URL dari Telegram
+
+1. Pasang kode crawler dan monitor dari versi yang sama. Tambahkan `--telegram-checks` pada akhir `ExecStart` crawler yang sudah ada. Gunakan mode browser dan `--limit 0`. Worker akan tetap menunggu permintaan setelah antrean rutin selesai.
+2. Gunakan database yang sama untuk `--db` crawler dan `CRAWLER_DB_PATH` monitor. User service monitor memerlukan akses tulis ke database dan direktori SQLite. Mulai ulang crawler terlebih dahulu agar tabel permintaan dibuat otomatis.
+3. Di environment monitor tambahkan `TELEGRAM_CHECKS_ENABLED=1`. Isi `TELEGRAM_ALLOWED_CHAT_IDS` dengan chat yang diizinkan. Untuk grup, isi juga `TELEGRAM_CHECK_USER_IDS` dengan ID numerik operator, dipisahkan koma. Setelah mengubah unit jalankan `sudo systemctl daemon-reload`, lalu restart service terkait pada jadwal deployment.
+4. Kirim `/cek https://contoh.id/berita/artikel-123`. Bot mengirim nomor permintaan dan kemudian hasil di chat asal. Pesan URL biasa tidak membuat permintaan. Path dan query dipakai untuk pemeriksaan, sedangkan query disembunyikan pada balasan hasil.
+
+Permintaan untuk URL yang sedang diproses mengikuti pekerjaan yang sama. Pemeriksaan sebelumnya yang selesai dapat dijalankan ulang. Untuk status `alerted` atau `pending_alert`, bot menampilkan status BIMA tersimpan beserta waktunya untuk menghindari laporan ganda. Pemeriksaan baru menggunakan mode BIMA crawler aktif, termasuk `--dry-run` jika dipasang. Untuk menguji deployment, gunakan database uji terpisah dan mode dry-run. Nomor permintaan tetap sama jika Telegram mengirim kembali update yang sama. Jika pengiriman hasil berhasil tepat sebelum proses bot terhenti, pesan hasil bisa terkirim kembali dengan nomor yang sama.
+
 
 Perintah yang didukung source yang dipulihkan:
 
@@ -543,7 +553,7 @@ sudo chmod 600 "$APP/multi/telegram_monitor.env"
 ```ini
 # /etc/systemd/system/pandi-telegram-monitor.service
 [Unit]
-Description=PANDI Crawler Telegram Monitor (read-only)
+Description=PANDI Crawler Telegram Monitor
 After=network-online.target
 Wants=network-online.target
 

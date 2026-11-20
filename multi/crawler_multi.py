@@ -30,6 +30,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
+
 _HTTP_LOCAL = threading.local()
 _INFERENCE_LOCK = threading.Lock()
 _STOP = threading.Event()
@@ -49,6 +51,8 @@ def arg_parser():
     p = argparse.ArgumentParser(description='PANDI parallel crawler; IndoBERT stays enabled')
     p.add_argument('--engine-file', default='/home/fauzi/crawler/crawler_url.py',
                    help='Existing single-worker script (imported for classifiers)')
+    p.add_argument('--telegram-checks', action='store_true',
+                   help='Prioritize Telegram checks and wait for new work after the routine queue drains')
     p.add_argument('--input', default='/home/fauzi/crawler/urls.json')
     p.add_argument('--db', default='/home/fauzi/crawler/crawler_multi.sqlite3')
     p.add_argument('--evidence-dir', default='',
@@ -171,41 +175,6 @@ def load_engine(filename, args):
     log(f'IndoBERT loaded ONCE from {engine.INDO_BERT_MODEL_PATH}; '
         f'batch={args.bert_batch_size}; torch_threads={threads}')
     return engine
-
-
-def normalize_input_url(value):
-    """Return a permitted .id URL, or None for ANY malformed input.
-
-    urllib.parse.urlparse/urlsplit can raise ValueError for malformed IPv6
-    brackets, invalid Unicode in netloc, or a non-numeric/out-of-range port.
-    A single bad entry in urls.json must not kill a 100k-URL crawler run.
-    """
-    try:
-        if not isinstance(value, str):
-            return None
-        value = value.strip()
-        if (not value or value.startswith('#') or len(value) > 8192 or
-                any(ord(c) < 32 or ord(c) == 127 for c in value)):
-            return None
-        if value.startswith('//'):
-            value = 'https:' + value
-        if '://' not in value:
-            value = 'https://' + value.lstrip('/')
-        parsed = urlparse(value)
-        if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
-            return None
-        if parsed.username or parsed.password:
-            return None
-        hostname = parsed.hostname.lower().rstrip('.')
-        # Crawling .id names only; redirects may go to non-.id public websites.
-        if not hostname.endswith('.id'):
-            return None
-        if parsed.port not in (None, 80, 443):
-            return None
-        return value.split('#', 1)[0]
-    except (ValueError, UnicodeError):
-        # In particular: ValueError('Invalid IPv6 URL') from urlparse().
-        return None
 
 
 def validate_public_target(url):
@@ -798,7 +767,7 @@ CREATE TABLE IF NOT EXISTS dns_host_audits (
 def connect_db(db_filename):
     Path(db_filename).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_filename, timeout=30)
-    conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA + CHECK_SCHEMA)
     # Safe additive migration for existing v1.2.1 databases.
     existing = {row[1] for row in conn.execute('PRAGMA table_info(jobs)')}
     for col, sqltype in (('route_reason','TEXT'), ('error_category','TEXT'),
@@ -857,6 +826,7 @@ def set_status(conn, id_, status, **updates):
     params = [status, utcnow(), *updates.values(), id_]
     with conn:
         conn.execute(f'UPDATE jobs SET {", ".join(columns)} WHERE id=?', params)
+        save_results(conn, id_, status, updates.get('reason'))
 
 
 def send_pending_alert(engine, conn, id_, url, confidence, screenshot_png, dry_run):
@@ -949,6 +919,9 @@ def print_stats(conn, elapsed, processed):
 
 def run(args):
     validate_options(args)
+    interactive = getattr(args, 'telegram_checks', False)
+    if interactive and (args.limit or args.http_only):
+        raise ValueError('--telegram-checks requires --limit 0 and browser support')
     engine = load_engine(args.engine_file, args)
     conn = connect_db(args.db)
     started = time.monotonic()
@@ -971,6 +944,11 @@ def run(args):
                 log(f'Network retries ready: {count} (retry-network enabled)')
             if args.retry_dry_run:
                 conn.execute("UPDATE jobs SET status='pending' WHERE status='dry_run_alert'")
+        # A crash after recording pending_alert may leave Telegram callers waiting.
+        with conn:
+            conn.execute("""UPDATE telegram_checks SET (result,risk,reason,checked_at) =
+                (SELECT status,risk,reason,updated_at FROM jobs WHERE jobs.id=telegram_checks.job_id)
+                WHERE result IS NULL AND job_id IN (SELECT id FROM jobs WHERE status='pending_alert')""")
         requeue_pending_alerts(conn, getattr(args, 'retry_pending_alerts', False))
         tasks = queue.Queue(maxsize=args.browser_queue_size)
         # One in-memory screenshot at a time to cap RAM usage on 2-vCPU / 4-GiB VMs.
@@ -1018,13 +996,22 @@ def run(args):
 
         def submit_one(pool):
             nonlocal last_id
-            row = conn.execute("SELECT id,url FROM jobs WHERE status='pending' "
-                               'AND id>? ORDER BY id LIMIT 1', (last_id,)).fetchone()
-            if row is None:
-                return False
-            id_, url = row
-            last_id = id_
             with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                priority = None
+                if interactive:
+                    priority = conn.execute(
+                        "SELECT j.id,j.url FROM telegram_checks t JOIN jobs j ON j.id=t.job_id "
+                        "WHERE t.result IS NULL AND j.status='pending' ORDER BY t.id LIMIT 1"
+                    ).fetchone()
+                row = priority or conn.execute(
+                    "SELECT id,url FROM jobs WHERE status='pending' AND id>? ORDER BY id LIMIT 1",
+                    (last_id,)).fetchone()
+                if row is None:
+                    return False
+                id_, url = row
+                if priority is None:
+                    last_id = id_
                 conn.execute("UPDATE jobs SET status='http_inflight', attempts=attempts+1, "
                              "updated_at=? WHERE id=?", (utcnow(), id_))
             futures[pool.submit(fetch_http, engine, url, args)] = (id_, url)
@@ -1038,6 +1025,9 @@ def run(args):
                     if not submit_one(pool):
                         break
                 if not futures:
+                    if interactive:
+                        _STOP.wait(1)
+                        continue
                     break
                 done, _ = concurrent.futures.wait(
                     futures, timeout=0.3,
