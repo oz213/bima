@@ -5016,7 +5016,34 @@ def has_strong_operator_gambling_promo(page_text, page_title=""):
     return bool(title_promo and account_calls and term_count >= 3)
 
 
-def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, ml_source="classic_ml", page_title=""):
+def has_slot_thailand_registration(page_title, page_html, current_url):
+    if not re.search(r"\bslot thailand\b", normalize_text_for_match(page_title)):
+        return False
+    html = page_html() if callable(page_html) else page_html
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.select("a[href]"):
+        if link.find_parent(["nav", "header", "footer", "template", "noscript"]):
+            continue
+        if link.find_parent(attrs={"hidden": True}) or link.has_attr("hidden"):
+            continue
+        label = link.get_text(" ", strip=True) or link.get("aria-label", "")
+        if normalize_text_for_match(label) not in ("daftar", "daftar sekarang", "daftar akun"):
+            continue
+        href = link["href"].strip()
+        if not href or href.startswith("#"):
+            continue
+        try:
+            target = urlparse(urljoin(current_url or "", href))
+            if target.scheme in ("https", "http") and target.hostname:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, ml_source="classic_ml", page_title="", page_html=None, current_url=""):
 
     text_hits = find_keyword_hits(page_text, STRONG_TEXT_KEYWORDS)
 
@@ -5176,6 +5203,9 @@ def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, m
 
 
 
+        if has_slot_thailand_registration(page_title, page_html, current_url):
+            return "high_risk", "ml_strong_slot_thailand_registration", text_hits + ["slot thailand", "registration link"]
+
         return "low_risk", "ml_strong_but_no_real_gambling_context", text_hits
 
 
@@ -5270,7 +5300,7 @@ def make_low_risk_result(captcha_hit, kw_hit, reason):
 
 
 
-def classify_text_content(source, url, page_text, page_title, current_url):
+def classify_text_content(source, url, page_text, page_title, current_url, page_html=None):
 
     captcha_hit = is_captcha_or_antibot_page(page_text, page_title)
 
@@ -5420,6 +5450,8 @@ def classify_text_content(source, url, page_text, page_title, current_url):
 
         ml_source=ml_source,
         page_title=page_title,
+        page_html=page_html,
+        current_url=current_url,
 
     )
 
@@ -7706,6 +7738,7 @@ def process_url(driver, url):
                 page_title=pre_title,
 
                 current_url=pre_final_url,
+                page_html=pre.get("html"),
 
             )
 
@@ -7880,6 +7913,7 @@ def process_url(driver, url):
         page_title=page_title,
 
         current_url=current_url,
+        page_html=lambda: driver.page_source,
 
     )
 

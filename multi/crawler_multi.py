@@ -306,7 +306,7 @@ def fetch_http(engine, input_url, args):
 # Use the original crawler_url.py decision engine as the ONLY authority for
 # detecting gambling. This module must not redefine any safe-context rules,
 # ML/IndoBERT thresholds, or combinations used for BIMA decisions.
-def classify_shared(engine, url, current_url, text, title, source='requests'):
+def classify_shared(engine, url, current_url, text, title, source='requests', page_html=None):
     # The original process_url() checks minimum text lengths BEFORE invoking
     # classify_text_content(): 50 characters for requests, 30 for Selenium.
     minimum = 50 if source == 'requests' else 30
@@ -338,7 +338,8 @@ def classify_shared(engine, url, current_url, text, title, source='requests'):
         try:
             legacy_result = engine.classify_text_content(
                 source=source, url=url, page_text=text,
-                page_title=title, current_url=current_url)
+                page_title=title, current_url=current_url,
+                **({"page_html": page_html} if hasattr(engine, "has_slot_thailand_registration") else {}))
         finally:
             engine.is_gambling_content_indobert = original_bert
 
@@ -689,7 +690,8 @@ def browser_loop(engine, tasks, results, args):
                     record.update(status='inconclusive', reason='short_or_empty_text')
                     continue
                 browser_cls = classify_shared(
-                    engine, input_url, final_url, text, title, source='selenium')
+                    engine, input_url, final_url, text, title, source='selenium',
+                    page_html=lambda: driver.page_source)
                 # The flat top-level decision stays queryable as before.
                 # Store the HTTP intermediate result only as audit metadata.
                 record['browser_classification'] = {
@@ -776,7 +778,14 @@ def connect_db(db_filename):
                          ('dns_host','TEXT')):
         if col not in existing:
             conn.execute(f'ALTER TABLE jobs ADD COLUMN {col} {sqltype}')
-    conn.execute('PRAGMA journal_mode=WAL')
+    journal_mode = os.environ.get('BIMA_SQLITE_JOURNAL_MODE', 'WAL').upper()
+    if journal_mode not in ('WAL', 'DELETE'):
+        conn.close()
+        raise ValueError('BIMA_SQLITE_JOURNAL_MODE must be WAL or DELETE')
+    actual_mode = conn.execute(f'PRAGMA journal_mode={journal_mode}').fetchone()[0]
+    if actual_mode.upper() != journal_mode:
+        conn.close()
+        raise RuntimeError(f'SQLite journal mode is {actual_mode}, expected {journal_mode}')
     conn.execute('PRAGMA busy_timeout=30000')
     conn.commit()
     return conn
@@ -1040,7 +1049,7 @@ def run(args):
                         class_started = time.monotonic()
                         cls = (classify_shared(engine, url, http.get('final_url', url),
                                                http.get('text', ''), http.get('title', ''),
-                                               source='requests')
+                                               source='requests', page_html=http.get('html'))
                                if (http.get('ok') or http.get('html')) and
                                   not http.get('hidden_gambling_hit') else
                                {'status': ('hidden_link_evidence'

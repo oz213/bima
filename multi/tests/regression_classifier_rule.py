@@ -4,6 +4,8 @@ Runs selected AST functions only, without importing live configs, ML weights,
 Chrome, network clients, or BIMA credentials.
 Usage: python3 test_classifier_rule.py /home/fauzi/crawler/crawler_url.py
 """
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 import ast
 import re
 import sys
@@ -17,12 +19,12 @@ required = {
     'has_real_gambling_context', 'has_safe_product_or_industrial_context',
     'has_safe_news_or_factcheck_context', 'has_contextual_gambling_phrase',
     'find_keyword_hits', 'has_strong_operator_gambling_promo',
-    'classify_risk',
+    'classify_risk', 'has_slot_thailand_registration',
 }
 functions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name in required]
 assert set(n.name for n in functions) == required, required - set(n.name for n in functions)
-globals_ = dict(re=re, INDO_BERT_THRESHOLD=0.80, INDO_BERT_STRONG_THRESHOLD=0.92,
+globals_ = dict(re=re, BeautifulSoup=BeautifulSoup, urljoin=urljoin, urlparse=urlparse, INDO_BERT_THRESHOLD=0.80, INDO_BERT_STRONG_THRESHOLD=0.92,
                 ML_THRESHOLD=0.55, ML_STRONG_THRESHOLD=0.90,
                 REQUIRE_GAMBLING_CONTEXT_FOR_ML=True)
 for n in tree.body:
@@ -42,6 +44,26 @@ class Regression(unittest.TestCase):
         return globals_['classify_risk'](page_text=text, page_title=title,
                 ml_hit=True, ml_conf=confidence, ml_pred=prediction,
                 captcha_hit=False, ml_source=source)
+
+    def test_slot_thailand_landing_page(self):
+        title = 'iBetWin: Layanan Pembayaran Slot Thailand Menggunakan USDT'
+        def classify(title, text, html, confidence=0.99, source='indobert'):
+            return globals_['classify_risk'](
+                text, True, confidence, ml_pred='gambling', ml_source=source,
+                page_title=title, page_html=html, current_url='https://example.id/')
+        cta = '<a href="/join"><b>DAFTAR</b></a>'
+        for source in ('indobert', 'classic_ml'):
+            self.assertEqual(classify(title, title+' DAFTAR', cta, source=source)[:2],
+                             ('high_risk', 'ml_strong_slot_thailand_registration'))
+        for heading, text, html, confidence in [
+            (title, title+' DAFTAR', '<p>DAFTAR</p>', 0.99),
+            ('Pendaftaran seminar USDT', 'Daftar seminar', cta, 0.99),
+            (title, title, cta, 0.65),
+            ('Berita penertiban Slot Thailand', 'Liputan penertiban', '<p>Daftar barang bukti</p>', 0.99),
+            (title, title, '<footer>'+cta+'</footer>', 0.99),
+        ]:
+            with self.subTest(heading=heading, html=html):
+                self.assertNotEqual(classify(heading, text, html, confidence)[0], 'high_risk')
 
     def test_zinergi_sample_strong_promo_is_high_risk(self):
         risk, reason, hits = self.classify()
