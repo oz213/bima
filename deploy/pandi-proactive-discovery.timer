@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule PANDI BIMA Proactive .id Discovery (PREVIEW ONLY)
+
+[Timer]
+OnCalendar=*:0/30
+RandomizedDelaySec=120
+Persistent=true
+Unit=pandi-proactive-discovery.service
+
+[Install]
+WantedBy=timers.target

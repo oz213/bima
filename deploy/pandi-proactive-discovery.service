@@ -1,0 +1,24 @@
+[Unit]
+Description=PANDI BIMA Proactive .id Discovery (PREVIEW ONLY)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/home/fauzi/crawler-rebuild/urls.json
+ConditionPathExists=/home/fauzi/crawler-rebuild/multi/state/crawler_production.sqlite3
+
+[Service]
+Type=oneshot
+User=fauzi
+Group=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B multi/proactive_discovery.py --input urls.json --db multi/state/crawler_production.sqlite3 --scan-web --seed-limit 20 --max-candidates-per-seed 30 --max-new 20 --max-pending 1000
+TimeoutStartSec=600
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/fauzi/crawler-rebuild/multi/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
