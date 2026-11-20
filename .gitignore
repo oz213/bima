@@ -15,7 +15,6 @@ multi/state/
 logs/
 
 # Credentials and local configuration
-/config.json
 /urls.json
 .env
 .env.*
