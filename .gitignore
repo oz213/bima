@@ -1,0 +1,38 @@
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime and database
+multi/state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.log
+logs/
+
+# Credentials and local configuration
+/config.json
+/urls.json
+.env
+.env.*
+*.pem
+*.key
+
+# Large model files
+*.safetensors
+*.pt
+*.pth
+
+# Browser cache and temporary files
+.cache/
+chrome-cache/
+tmp/
+*.tmp
+
+# Recovery archives and legacy backup
+crawler_url_june_backup.py
+crawler_production_recovered*.sqlite3
