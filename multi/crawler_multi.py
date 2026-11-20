@@ -12,6 +12,7 @@ import concurrent.futures
 import hashlib
 import importlib.util
 import io
+import itertools
 import ipaddress
 import json
 import os
@@ -601,6 +602,20 @@ def evidence_screenshot(engine, driver, url, evidence, output_dir=None):
             watermarked_image.close()
 
 
+class TelegramBrowserQueue(queue.PriorityQueue):
+    """Serve requested pages first, keeping FIFO within each priority."""
+    def __init__(self, maxsize):
+        super().__init__(maxsize)
+        self.sequence = itertools.count()
+
+    def _put(self, task):
+        priority = 2 if task is None else (0 if task.get('telegram_requested') else 1)
+        super()._put((priority, next(self.sequence), task))
+
+    def _get(self):
+        return super()._get()[2]
+
+
 def browser_loop(engine, tasks, results, args):
     # Follow original crawler_url.py process_url() alert decision order:
     # 1) HTTP hidden gambling evidence => screenshot + alert (confidence 0.60)
@@ -959,7 +974,8 @@ def run(args):
                 (SELECT status,risk,reason,updated_at FROM jobs WHERE jobs.id=telegram_checks.job_id)
                 WHERE result IS NULL AND job_id IN (SELECT id FROM jobs WHERE status='pending_alert')""")
         requeue_pending_alerts(conn, getattr(args, 'retry_pending_alerts', False))
-        tasks = queue.Queue(maxsize=args.browser_queue_size)
+        queue_type = TelegramBrowserQueue if interactive else queue.Queue
+        tasks = queue_type(maxsize=args.browser_queue_size)
         # One in-memory screenshot at a time to cap RAM usage on 2-vCPU / 4-GiB VMs.
         browser_results = queue.Queue(maxsize=1)
         browser_thread = None
@@ -1010,9 +1026,12 @@ def run(args):
                 priority = None
                 if interactive:
                     priority = conn.execute(
-                        "SELECT j.id,j.url FROM telegram_checks t JOIN jobs j ON j.id=t.job_id "
+                        "SELECT j.id,j.url FROM telegram_checks t CROSS JOIN jobs j ON j.id=t.job_id "
                         "WHERE t.result IS NULL AND j.status='pending' ORDER BY t.id LIMIT 1"
                     ).fetchone()
+                # Leave capacity for interactive work when Selenium is backlogged.
+                if interactive and priority is None and waiting_browser + len(futures) >= args.browser_queue_size:
+                    return False
                 row = priority or conn.execute(
                     "SELECT id,url FROM jobs WHERE status='pending' AND id>? ORDER BY id LIMIT 1",
                     (last_id,)).fetchone()
@@ -1088,9 +1107,12 @@ def run(args):
                         elif next_status == 'browser_queued':
                             set_status(conn, id_, 'browser_queued', **updates)
                             if not args.http_only:
+                                requested = interactive and conn.execute(
+                                    'SELECT 1 FROM telegram_checks WHERE job_id=? AND result IS NULL LIMIT 1',
+                                    (id_,)).fetchone() is not None
                                 while True:
                                     try:
-                                        tasks.put({'id': id_, 'url': url,
+                                        tasks.put({'id': id_, 'url': url, 'telegram_requested': requested,
                                                    'http_classification': cls,
                                                    'http_result': http}, timeout=0.5)
                                         waiting_browser += 1
@@ -1113,7 +1135,6 @@ def run(args):
                             f'elapsed={time.monotonic()-started:.0f}s')
                         logged = processed
         if browser_thread is not None:
-            tasks.put(None)
             while waiting_browser:
                 try:
                     item = browser_results.get(timeout=2)
@@ -1123,6 +1144,8 @@ def run(args):
                     if not browser_thread.is_alive():
                         log('ERROR: browser worker exited unexpectedly')
                         break
+            if browser_thread.is_alive():
+                tasks.put(None)
             browser_thread.join(timeout=5)
         print_stats(conn, time.monotonic()-started, processed)
     finally:

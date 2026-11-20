@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS telegram_checks (
     result TEXT, risk TEXT, reason TEXT, checked_at TEXT, delivered INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS telegram_waiting ON telegram_checks(job_id) WHERE result IS NULL;
+CREATE INDEX IF NOT EXISTS telegram_waiting_order ON telegram_checks(id) WHERE result IS NULL;
 CREATE INDEX IF NOT EXISTS telegram_outbox ON telegram_checks(id) WHERE delivered=0 AND result IS NOT NULL;
 """
 

@@ -22,6 +22,14 @@ class TelegramChecks(unittest.TestCase):
     def command(self, command, update=1, sender='42', chat='-7'):
         return bot.handle_command(command, chat, {'-7', '123'}, self.path, update, sender)
 
+    def test_browser_priority_and_fifo(self):
+        tasks = cm.TelegramBrowserQueue(5)
+        for number, requested in enumerate([False, True, False, True]):
+            tasks.put({'id': number, 'telegram_requested': requested})
+        tasks.put(None)
+        self.assertEqual([tasks.get()['id'] for _ in range(4)], [1, 3, 0, 2])
+        self.assertIsNone(tasks.get())
+
     def test_access_validation_and_explicit_command(self):
         for cmd, sender in [('/cek https://example.com', '42'), ('/cek x.id', '99'),
                             ('/cek', '42'), ('https://x.id', '42')]:
