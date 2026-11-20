@@ -317,6 +317,23 @@ def deliver_checks(token, db_path, allowed):
             with conn:
                 conn.execute('UPDATE telegram_checks SET delivered=1 WHERE id=?', (number,))
 
+        active = conn.execute("""SELECT t.id,t.chat_id,j.url
+            FROM telegram_checks t CROSS JOIN jobs j ON j.id=t.job_id
+            WHERE t.result IS NULL AND t.progress_sent=0
+              AND j.status IN ('http_inflight','browser_queued')
+            ORDER BY t.id LIMIT 20""").fetchall()
+        for number, chat, url in active:
+            if chat in allowed:
+                try:
+                    send_message(token, chat, f'#{number} {safe_domain(url)} — Sedang diperiksa.')
+                except HTTPError as error:
+                    if error.code not in (400, 403):
+                        raise
+                    LOGGER.warning('Telegram menolak status #%d (HTTP %d)', number, error.code)
+            with conn:
+                conn.execute('UPDATE telegram_checks SET progress_sent=1 WHERE id=?', (number,))
+
+
 
 def safe_network_error(error):
     """No URL, path or Telegram token must appear in systemd logs."""

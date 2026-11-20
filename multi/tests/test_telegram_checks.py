@@ -56,6 +56,54 @@ class TelegramChecks(unittest.TestCase):
         self.command(cmd, update=4)
         self.assertEqual(self.db.execute('SELECT status FROM jobs').fetchone()[0], 'alerted')
 
+    def test_progress_after_dispatch_only(self):
+        self.command('/cek contoh.id/page?secret=value')
+        job_id = self.db.execute('SELECT id FROM jobs').fetchone()[0]
+        with patch.object(bot, 'send_message') as send:
+            bot.deliver_checks('unused', self.path, {'-7'})
+            send.assert_not_called()
+            cm.set_status(self.db, job_id, 'http_inflight')
+            bot.deliver_checks('unused', self.path, {'-7'})
+            bot.deliver_checks('unused', self.path, {'-7'})
+            send.assert_called_once()
+            self.assertIn('Sedang diperiksa', send.call_args.args[2])
+            self.assertNotIn('secret', send.call_args.args[2])
+            cm.set_status(self.db, job_id, 'complete')
+            bot.deliver_checks('unused', self.path, {'-7'})
+            self.assertEqual(send.call_count, 2)
+
+    def test_request_arriving_while_shared_slot_busy(self):
+        import threading
+        args = cm.arg_parser().parse_args(['--telegram-checks','--limit','0','--db',str(self.path)])
+        args.http_workers = 1
+        args.input = str(self.path.parent/'urls.json')
+        Path(args.input).write_text('["first.id","second.id"]')
+        release = threading.Event()
+        started = threading.Event()
+        order = []
+        wait = cm.concurrent.futures.wait
+        def fetch(engine, url, options):
+            order.append(url)
+            if len(order) == 1:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError('test worker timed out')
+            return {'reason':'non_html_content','ok':False}
+        def during_wait(futures, **kwargs):
+            if not release.is_set():
+                try:
+                    self.assertTrue(started.wait(5))
+                    self.command('/cek priority.id')
+                finally:
+                    release.set()
+            return wait(futures, **kwargs)
+        self.addCleanup(cm._STOP.clear)
+        with patch.object(cm, 'load_engine'), patch.object(cm, 'fetch_http', side_effect=fetch), \
+             patch.object(cm.concurrent.futures, 'wait', side_effect=during_wait), \
+             patch.object(cm._STOP, 'wait', side_effect=lambda _: cm._STOP.set()):
+            cm.run(args)
+        self.assertEqual(order, ['https://first.id','https://priority.id','https://second.id'])
+
     def test_worker_takes_priority_before_routine(self):
         args = cm.arg_parser().parse_args(['--telegram-checks','--limit','0','--db',str(self.path)])
         args.input = str(self.path.parent/'urls.json')

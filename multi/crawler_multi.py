@@ -785,6 +785,8 @@ def connect_db(db_filename):
     Path(db_filename).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_filename, timeout=30)
     conn.executescript(SCHEMA + CHECK_SCHEMA)
+    if 'progress_sent' not in {r[1] for r in conn.execute('PRAGMA table_info(telegram_checks)')}:
+        conn.execute('ALTER TABLE telegram_checks ADD COLUMN progress_sent INTEGER NOT NULL DEFAULT 0')
     # Safe additive migration for existing v1.2.1 databases.
     existing = {row[1] for row in conn.execute('PRAGMA table_info(jobs)')}
     for col, sqltype in (('route_reason','TEXT'), ('error_category','TEXT'),
@@ -1045,10 +1047,12 @@ def run(args):
             futures[pool.submit(fetch_http, engine, url, args)] = (id_, url)
             return True
 
+        # In interactive mode the executor must not hold routine work for a busy slot.
+        submission_limit = args.http_workers if interactive else args.http_workers * 2
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.http_workers) as pool:
             while not _STOP.is_set():
                 drain_browser_results()
-                while (len(futures) < args.http_workers * 2 and
+                while (len(futures) < submission_limit and
                        processed + len(futures) < limit):
                     if not submit_one(pool):
                         break
@@ -1063,6 +1067,9 @@ def run(args):
                 for future in done:
                     id_, url = futures.pop(future)
                     processed += 1
+                    # Pick the next URL before synchronous classification or browser backpressure.
+                    if interactive and not _STOP.is_set():
+                        submit_one(pool)
                     try:
                         http = future.result()
                         class_started = time.monotonic()
