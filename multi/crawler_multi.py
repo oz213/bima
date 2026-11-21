@@ -870,6 +870,29 @@ def set_status(conn, id_, status, **updates):
         save_results(conn, id_, status, updates.get('reason'))
 
 
+def build_browser_result_updates(result):
+    """Preserve original HTTP risk when Selenium only captures alert evidence.
+
+    The HTTP decision and classifier_json were persisted when the browser
+    task was queued. No browser classification exists for the legacy
+    HTTP-positive/hidden-link screenshot paths, so do not erase those fields.
+    """
+    updates = {'browser_ms': result.get('browser_ms'),
+               'reason': result.get('reason'),
+               'final_url': result.get('final_url'),
+               'evidence_path': None,
+               'alert_confidence': result.get('confidence'),
+               'error': result.get('error')}
+    browser_cls = result.get('browser_classification')
+    if isinstance(browser_cls, dict) and browser_cls:
+        updates['risk'] = browser_cls.get('status')
+        updates['classifier_json'] = json.dumps(browser_cls)
+    elif result.get('status') != 'pending_alert':
+        # Preserve legacy behavior for non-alert browser failures.
+        updates['risk'] = None
+    return updates
+
+
 def send_pending_alert(engine, conn, id_, url, confidence, screenshot_png, dry_run):
     """Send screenshot directly from RAM to original BIMA endpoint.
 
@@ -1020,15 +1043,7 @@ def run(args):
             waiting_browser -= 1
             id_ = result['id']
             state = result['status']
-            updates = {'browser_ms': result.get('browser_ms'),
-                       'reason': result.get('reason'),
-                       'final_url': result.get('final_url'),
-                       'evidence_path': None,
-                       'alert_confidence': result.get('confidence'),
-                       'error': result.get('error'),
-                       'risk': result.get('browser_classification', {}).get('status')}
-            if result.get('browser_classification'):
-                updates['classifier_json'] = json.dumps(result['browser_classification'])
+            updates = build_browser_result_updates(result)
             set_status(conn, id_, state, **updates)
             if state == 'pending_alert':
                 # PNG bytes move only through the bounded in-memory results queue.
