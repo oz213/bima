@@ -330,6 +330,49 @@ class FetchResult:
     redirects: tuple[RedirectObservation, ...] = ()
 
 
+# Fallback is a deliberate opt-in, not a way to bypass robots access rules.
+# Only failures opening HTTPS are eligible. DNS errors and security-policy
+# failures are deliberately excluded: HTTP would not make them trustworthy.
+HTTPS_FALLBACK_ERRORS = frozenset({
+    'TimeoutError', 'ConnectionRefusedError', 'ConnectionResetError',
+    'ConnectionAbortedError', 'BrokenPipeError', 'RemoteDisconnected',
+    'SSLError', 'SSLCertVerificationError', 'SSLEOFError',
+})
+
+
+def can_fallback_to_http(result: FetchResult) -> bool:
+    """A transport failure, never a response, redirect, or scope violation."""
+    return (result.status == 0 and not result.redirects
+            and result.error in HTTPS_FALLBACK_ERRORS)
+
+
+def fetch_failure_kind(result: FetchResult) -> str:
+    """Bounded public error category; never include URL or exception text."""
+    if result.error in ('gaierror', 'dns_no_answers'):
+        return 'dns'
+    if result.error == 'TimeoutError':
+        return 'timeout'
+    if result.error in ('SSLError', 'SSLCertVerificationError', 'SSLEOFError'):
+        return 'tls'
+    if result.error in ('ConnectionRefusedError', 'ConnectionResetError',
+                        'ConnectionAbortedError', 'BrokenPipeError', 'RemoteDisconnected'):
+        return 'connection'
+    if result.error == 'redirect_out_of_scope':
+        return 'external_redirect'
+    if result.error in ('out_of_scope', 'redirect_invalid', 'ValueError',
+                        'dns_non_public_address'):
+        return 'unsafe_or_invalid'
+    if result.status in (401, 403):
+        return 'access_denied'
+    if result.status in (429, 503):
+        return 'rate_limited'
+    if result.status >= 400:
+        return 'http_status'
+    if result.error in ('non_text', 'oversize', 'redirect_limit'):
+        return result.error
+    return 'other'
+
+
 class PinnedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host: str, ip: str, port: int, timeout: float):
         super().__init__(host, port, timeout=timeout)
@@ -494,13 +537,23 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                   max_candidates: int = 30, max_sitemaps: int = 2,
                   probe_candidates: int = 0,
                   redirect_observer: Callable[[RedirectObservation], None] | None = None,
+                  http_fallback: bool = False,
                   ) -> tuple[list[Candidate], dict]:
-    """Discover, but never fetch any discovered page or trigger BIMA alerts."""
+    """Discover public URLs without browser execution or BIMA alerts.
+
+    With explicit http_fallback=True, try HTTP only after certain HTTPS
+    transport failures. Always check HTTP robots separately, never use an
+    HTTPS robots policy as permission to crawl a different origin.
+    """
     found: dict[str, Candidate] = {}
     robots_policy = None
+    root_url = 'https://' + seed + '/'
+    allowed = False
     counters = {'web_requests': 0, 'web_errors': 0, 'ct_errors': 0,
                 'redirect_observations': 0, 'external_redirects': 0,
-                'probed_pages': 0, 'probe_errors': 0}
+                'probed_pages': 0, 'probe_errors': 0,
+                'http_fallback_attempts': 0, 'http_fallback_success': 0,
+                'http_fallback_blocked': 0, 'fetch_failure_types': {}}
 
     def observe(result: FetchResult):
         for item in result.redirects:
@@ -509,61 +562,129 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
             if redirect_observer is not None:
                 redirect_observer(item)
 
+    def note_failure(result: FetchResult):
+        kind = fetch_failure_kind(result)
+        failures = counters['fetch_failure_types']
+        failures[kind] = failures.get(kind, 0) + 1
+
     def add(value: str, source: str):
         item = make_candidate(value, seed=seed, source=source)
         if item is not None:
-            if robots_policy is not None and host_of(item.url) == seed:
-                if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, item.url):
+            if (robots_policy is not None and host_of(item.url) == seed and
+                    urlsplit(item.url).scheme == urlsplit(root_url).scheme):
+                if not robots_policy.can_fetch(USER_AGENT, item.url):
                     return
             previous = found.get(item.url)
             if previous is None or previous.priority_score < item.priority_score:
                 found[item.url] = item
 
-    if fetch is not None:
-        root_url = 'https://' + seed + '/'
-        robots = fetch('https://' + seed + '/robots.txt')
+    def get_robots(origin: str):
+        """Return (permission, policy, sitemaps, response, effective_origin)."""
+        response = fetch(origin + 'robots.txt')
         counters['web_requests'] += 1
-        allowed = robots.status == 404
-        rp = robotparser.RobotFileParser()
+        observe(response)
+        # robots.txt with unreadable/oversize/non-text HTTP 200 is NOT an
+        # affirmative allow, even if the status code says 200.
+        usable = (response.status == 404 and response.error in ('', 'http_status')) or (
+            response.status == 200 and not response.error)
+        if not usable:
+            note_failure(response)
+            return False, None, [], response, origin
+        # A same-seed *subdomain* robots file must not authorize seed pages.
+        # A same-host HTTPS->HTTP redirect gets its own effective origin.
+        if host_of(response.final_url) != seed:
+            counters['fetch_failure_types']['unsafe_or_invalid'] = (
+                counters['fetch_failure_types'].get('unsafe_or_invalid', 0) + 1)
+            return False, None, [], response, origin
+        effective_origin = urlsplit(response.final_url).scheme + '://' + seed + '/'
+        if response.status == 404:
+            return True, None, [], response, effective_origin
+        policy = robotparser.RobotFileParser()
+        policy.parse(response.text.splitlines())
         sitemaps = []
-        if robots.status == 200:
-            rp.parse(robots.text.splitlines())
-            robots_policy = rp
-            allowed = rp.can_fetch(USER_AGENT, root_url)
-            for line in robots.text.splitlines():
-                if line.lower().lstrip().startswith('sitemap:'):
-                    sitemaps.append(line.partition(':')[2].strip())
-        elif robots.status != 404:
+        for line in response.text.splitlines():
+            if line.lower().lstrip().startswith('sitemap:'):
+                sitemaps.append(line.partition(':')[2].strip())
+        return (policy.can_fetch(USER_AGENT, effective_origin), policy,
+                sitemaps, response, effective_origin)
+
+    if fetch is not None:
+        allowed, robots_policy, sitemaps, robots, root_url = get_robots(root_url)
+        fallback_tried = False
+        if (not allowed and robots.status not in (200, 404)
+                and http_fallback and can_fallback_to_http(robots)):
+            fallback_tried = True
+            counters['http_fallback_attempts'] += 1
+            root_url = 'http://' + seed + '/'
+            allowed, robots_policy, sitemaps, robots, root_url = get_robots(root_url)
+            if not allowed:
+                counters['http_fallback_blocked'] += 1
+        if (not allowed and (robots.status not in (200, 404) or
+                             robots.error not in ('', 'http_status') or
+                             host_of(robots.final_url) != seed)):
             counters['web_errors'] += 1
         if allowed:
             homepage = fetch(root_url)
             counters['web_requests'] += 1
             observe(homepage)
-            if homepage.status == 200:
-                parser = Links()
-                parser.feed(homepage.text)
-                for link in parser.links:
-                    add(urljoin(homepage.final_url, link), 'homepage')
-            elif homepage.error not in ('redirect_out_of_scope',):
-                counters['web_errors'] += 1
-            if not sitemaps:
-                sitemaps.append('https://' + seed + '/sitemap.xml')
-            visited_sitemaps = set()
-            while sitemaps and len(visited_sitemaps) < max_sitemaps:
-                sitemap = normalize_url(sitemaps.pop(0))
-                if not sitemap or not within_seed(sitemap, seed) or sitemap in visited_sitemaps:
-                    continue
-                visited_sitemaps.add(sitemap)
-                doc = fetch(sitemap)
-                counters['web_requests'] += 1
-                observe(doc)
-                if doc.status != 200:
+            if homepage.status != 200 or homepage.error:
+                note_failure(homepage)
+            # An HTTPS robots 200/404 is NOT permission to scan HTTP. A
+            # failed HTTPS homepage needs a separate HTTP robots check.
+            if (http_fallback and not fallback_tried and root_url.startswith('https://')
+                    and can_fallback_to_http(homepage)):
+                fallback_tried = True
+                counters['http_fallback_attempts'] += 1
+                http_root = 'http://' + seed + '/'
+                http_allowed, http_policy, http_maps, http_robots, http_root = get_robots(http_root)
+                if http_allowed:
+                    allowed = True
+                    robots_policy, sitemaps, root_url = http_policy, http_maps, http_root
+                    homepage = fetch(root_url)
+                    counters['web_requests'] += 1
+                    observe(homepage)
+                    if homepage.status != 200 or homepage.error:
+                        note_failure(homepage)
+                else:
+                    allowed = False
+                    counters['http_fallback_blocked'] += 1
                     counters['web_errors'] += 1
-                    continue
-                pages, nested = parse_sitemap(doc.text)
-                for page in pages:
-                    add(page, 'sitemap')
-                sitemaps.extend(nested)
+            if allowed:
+                if homepage.status == 200 and not homepage.error:
+                    parser = Links()
+                    parser.feed(homepage.text)
+                    for link in parser.links:
+                        add(urljoin(homepage.final_url, link), 'homepage')
+                elif homepage.error != 'redirect_out_of_scope':
+                    counters['web_errors'] += 1
+                if fallback_tried and ((homepage.status == 200 and not homepage.error) or
+                                       homepage.error == 'redirect_out_of_scope'):
+                    counters['http_fallback_success'] += 1
+                if not sitemaps:
+                    sitemaps.append(root_url + 'sitemap.xml')
+                visited_sitemaps = set()
+                while sitemaps and len(visited_sitemaps) < max_sitemaps:
+                    sitemap = normalize_url(sitemaps.pop(0))
+                    # A sitemap on another scheme/host needs a distinct
+                    # robots check; do not fetch it under this origin's grant.
+                    if (not sitemap or host_of(sitemap) != seed or
+                            urlsplit(sitemap).scheme != urlsplit(root_url).scheme or
+                            sitemap in visited_sitemaps):
+                        continue
+                    if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, sitemap):
+                        continue
+                    visited_sitemaps.add(sitemap)
+                    doc = fetch(sitemap)
+                    counters['web_requests'] += 1
+                    observe(doc)
+                    if doc.status != 200 or doc.error:
+                        note_failure(doc)
+                        counters['web_errors'] += 1
+                        continue
+                    pages, nested = parse_sitemap(doc.text)
+                    for page in pages:
+                        add(page, 'sitemap')
+                    sitemaps.extend(nested)
     if include_ct and ct_lookup is not None:
         try:
             for url in ct_lookup(seed):
@@ -571,12 +692,12 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         except (OSError, ValueError, TimeoutError, json.JSONDecodeError):
             counters['ct_errors'] += 1
     ordered = sorted(found.values(), key=lambda c: (-c.priority_score, c.url))[:max_candidates]
-    # Probe ONLY a bounded sample of discovered pages on the seed host.
-    # Cross-host subdomains remain queue candidates, never direct probes here:
-    # they require their own robots policy. The pinned SafeFetcher will record
-    # off-scope redirect destinations without contacting those destinations.
+    # Probe ONLY a bounded sample of discovered pages on the seed host
+    # and on the exact origin whose robots policy was checked above.
+    # Cross-host subdomains require their own robots policy before fetching.
     if fetch is not None and probe_candidates > 0 and allowed:
-        for item in (x for x in ordered if host_of(x.url) == seed):
+        for item in (x for x in ordered if host_of(x.url) == seed
+                     and urlsplit(x.url).scheme == urlsplit(root_url).scheme):
             if counters['probed_pages'] >= probe_candidates:
                 break
             if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, item.url):
@@ -585,8 +706,19 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
             counters['probed_pages'] += 1
             counters['web_requests'] += 1
             observe(result)
-            if result.status != 200 and result.error != 'redirect_out_of_scope':
-                counters['probe_errors'] += 1
+            if result.status != 200 or result.error:
+                note_failure(result)
+                if result.error != 'redirect_out_of_scope':
+                    counters['probe_errors'] += 1
+            # A redirect is a priority signal, not an abuse determination.
+            # Only evidence originating at the probed .id URL influences
+            # that URL's queue priority, not the external destination.
+            if any(obs.external and obs.source_url == item.url and
+                   obs.method in ('http', 'meta_refresh') for obs in result.redirects):
+                found[item.url] = Candidate(item.url, item.source,
+                                            item.seed_hostname,
+                                            min(100, item.priority_score + 30))
+        ordered = sorted(found.values(), key=lambda c: (-c.priority_score, c.url))[:max_candidates]
     return ordered, counters
 
 
@@ -703,7 +835,9 @@ def run(args) -> dict:
         candidates: dict[str, Candidate] = {}
         stats = {'web_requests': 0, 'web_errors': 0, 'ct_errors': 0,
                  'redirect_observations': 0, 'external_redirects': 0,
-                 'probed_pages': 0, 'probe_errors': 0}
+                 'probed_pages': 0, 'probe_errors': 0,
+                 'http_fallback_attempts': 0, 'http_fallback_success': 0,
+                 'http_fallback_blocked': 0, 'fetch_failure_types': {}}
         redirects_by_key: dict[tuple[str, str, str], RedirectObservation] = {}
         def observe_redirect(item: RedirectObservation):
             redirects_by_key[(item.source_url, item.destination_url, item.method)] = item
@@ -718,9 +852,15 @@ def run(args) -> dict:
                 max_candidates=args.max_candidates_per_seed,
                 max_sitemaps=args.max_sitemaps,
                 probe_candidates=args.probe_candidates,
-                redirect_observer=observe_redirect)
+                redirect_observer=observe_redirect,
+                http_fallback=getattr(args, 'http_fallback', False))
             for k, v in counters.items():
-                stats[k] += v
+                if k == 'fetch_failure_types':
+                    for category, count in v.items():
+                        totals = stats['fetch_failure_types']
+                        totals[category] = totals.get(category, 0) + count
+                else:
+                    stats[k] += v
             for item in items:
                 old = candidates.get(item.url)
                 if old is None or item.priority_score > old.priority_score:
@@ -745,7 +885,8 @@ def run(args) -> dict:
             'next_index': next_cursor, 'candidate_urls': len(ordered),
             'new_jobs': new, 'held_candidates': held,
             'pending_before': before, 'pending_after': after,
-            'scan_web': args.scan_web, 'ct': args.ct, **stats,
+            'scan_web': args.scan_web, 'ct': args.ct,
+            'http_fallback': getattr(args, 'http_fallback', False), **stats,
             'unique_redirects': len(redirect_events),
             'preview_redirects': [
                 {'source': item.source_url, 'destination': item.destination_url,
@@ -768,6 +909,8 @@ def arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--input', default='urls.json', help='Registry-derived urls.json (read-only)')
     parser.add_argument('--db', default='multi/state/crawler_production.sqlite3')
     parser.add_argument('--scan-web', action='store_true', help='Fetch public .id homepage/robots/sitemap')
+    parser.add_argument('--http-fallback', action='store_true',
+                        help='Opt-in: HTTPS transport failure -> HTTP only after separate robots check')
     parser.add_argument('--ct', action='store_true', help='Optional crt.sh public CT lookup (sends seed hostname)')
     parser.add_argument('--apply', action='store_true', help='ENQUEUE jobs into crawler DB; may trigger BIMA alerts')
     parser.add_argument('--seed-limit', type=int, default=20)
@@ -796,6 +939,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('probe-candidates must be 0..max-candidates-per-seed')
     if args.probe_candidates and not args.scan_web:
         raise SystemExit('--probe-candidates requires --scan-web')
+    if args.http_fallback and not args.scan_web:
+        raise SystemExit('--http-fallback requires --scan-web')
     if args.timeout <= 0 or args.request_interval < 0 or args.preview_samples < 0 or args.min_host_interval < 0:
         raise SystemExit('timeout must be positive; interval/samples must be nonnegative')
     if args.start_index is not None and args.start_index < 0:
