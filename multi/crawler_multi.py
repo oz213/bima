@@ -322,6 +322,14 @@ def fetch_http(engine, input_url, args):
 # Use the original crawler_url.py decision engine as the ONLY authority for
 # detecting gambling. This module must not redefine any safe-context rules,
 # ML/IndoBERT thresholds, or combinations used for BIMA decisions.
+def capture_review_excerpt(classification, text):
+    if (os.environ.get("BIMA_REVIEW_EXCERPTS") == "1"
+            and classification.get("status") in ("medium_risk", "high_risk")):
+        excerpt = " ".join((text or "")[:2400].split())[:600]
+        if len(excerpt) >= 40:
+            classification["review_excerpt"] = excerpt
+
+
 def classify_shared(engine, url, current_url, text, title, source='requests', page_html=None):
     # The original process_url() checks minimum text lengths BEFORE invoking
     # classify_text_content(): 50 characters for requests, 30 for Selenium.
@@ -724,6 +732,7 @@ def browser_loop(engine, tasks, results, args):
                     page_html=lambda: driver.page_source)
                 # The flat top-level decision stays queryable as before.
                 # Store the HTTP intermediate result only as audit metadata.
+                capture_review_excerpt(browser_cls, text)
                 record['browser_classification'] = {
                     **browser_cls, 'http_classification': http_cls}
                 record['reason'] = browser_cls.get('reason')
@@ -1128,6 +1137,7 @@ def run(args):
                                 'reason': ('hidden_link_http'
                                            if http.get('hidden_gambling_hit') else http.get('reason')),
                                 'bert_used': False, 'ml_conf': 0.0})
+                        capture_review_excerpt(cls, http.get("text"))
                         class_ms = round((time.monotonic() - class_started) * 1000)
                         attempts = conn.execute('SELECT attempts FROM jobs WHERE id=?',
                                                 (id_,)).fetchone()[0]

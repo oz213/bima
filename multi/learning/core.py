@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS case_evidence (
     origin TEXT NOT NULL,
     attached_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telegram_incidents (
+    case_id INTEGER PRIMARY KEY REFERENCES review_cases(id),
+    verdict TEXT NOT NULL CHECK(verdict IN ('true_positive','false_positive')),
+    reviewer TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS review_events (
     id INTEGER PRIMARY KEY,
     case_id INTEGER NOT NULL REFERENCES review_cases(id) ON DELETE RESTRICT,
@@ -158,6 +164,7 @@ def candidate_from_job(row):
         "candidate_kind": kind,
         "model_metadata_json": dumps(meta),
         "snapshot_sha256": sha256_text(dumps(snapshot)),
+        "excerpt": final.get("review_excerpt"),
     }
 
 
@@ -241,6 +248,10 @@ def seed_review_queue(production_db, learning_db, limit=5000):
                     ),
                 )
                 inserted += cursor.rowcount
+                excerpt = c.get("excerpt")
+                if cursor.rowcount and isinstance(excerpt, str) and 40 <= len(excerpt) <= 600:
+                    conn.execute("INSERT INTO case_evidence VALUES(?,?,?,?,?)",
+                                 (cursor.lastrowid, excerpt, sha256_text(excerpt), "crawler_excerpt", at))
     return {"scanned_alerts": scanned, "candidates": len(candidates),
             "new_cases": inserted, "already_present": len(candidates) - inserted}
 
@@ -309,6 +320,11 @@ def review_case(learning_db, case_id, label, reviewer, note, domain_group=None,
             raise ValueError("--domain-group must be an explicit .id domain")
     with learning_connection(learning_db) as conn:
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            incident = conn.execute("SELECT verdict FROM telegram_incidents WHERE case_id=?",
+                                    (case_id,)).fetchone()
+            if incident and incident[0] != label:
+                raise ValueError("Incident already decided in Telegram")
             case = conn.execute(
                 "SELECT label,domain_group FROM review_cases WHERE id=?", (case_id,)
             ).fetchone()

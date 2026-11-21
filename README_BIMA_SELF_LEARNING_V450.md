@@ -196,3 +196,48 @@ sudo systemctl start pandi-learning.service &&
 sudo systemctl enable --now pandi-learning.timer
 sudo journalctl -u pandi-learning.service -n 30 --no-pager
 ```
+
+## v4.5.2 — Review lewat Telegram
+
+Di chat pribadi bot, kirim /id untuk memperoleh ID numerik. Pada server,
+jalankan `sudo systemctl edit pandi-telegram-monitor.service` dan tambahkan:
+
+```ini
+[Service]
+Environment=TELEGRAM_REVIEW_USER_IDS=123456789
+```
+
+Ganti angka dengan ID pribadi reviewer. Tambahkan ID pribadi tersebut juga ke
+TELEGRAM_ALLOWED_CHAT_IDS pada konfigurasi yang sudah dipakai monitor; pertahankan
+ID chat lain. BIMA_LEARNING_DB dapat diatur pada service monitor apabila learning
+menggunakan database selain multi/state/bima_learning_v450.sqlite3 milik checkout.
+
+Untuk menyertakan cuplikan pada kasus baru, gunakan
+`sudo systemctl edit pandi-crawler-multi.service`:
+
+```ini
+[Service]
+Environment=BIMA_REVIEW_EXCERPTS=1
+```
+
+Opsi ini menyimpan hingga 600 karakter teks halaman pada metadata klasifikasi
+medium/high risk. Saat seed berikutnya, learning menyalin cuplikan hasil akhir
+untuk kasus baru yang memenuhi kriteria. Teks dapat memuat data dari halaman asli.
+Jika opsi dimatikan, reviewer tetap dapat memasukkan kutipan dengan /bukti.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart pandi-telegram-monitor.service pandi-crawler-multi.service
+sudo systemctl is-active pandi-telegram-monitor.service pandi-crawler-multi.service
+```
+
+- /review menampilkan satu situs dari antrean. /review 12 membuka kembali kasus 12.
+- Jika cuplikan tersedia, tombol Judol atau Bukan judol menyimpan keputusan situs
+  dan label teks sekaligus. Gunakan Nilai situs saja jika isi cuplikan dan perilaku
+  situs berbeda. Bot kemudian meminta keputusan khusus teks.
+- Untuk kasus lama tanpa cuplikan, tombol menyimpan keputusan situs dahulu.
+  Kirim /bukti 12 diikuti kutipan asli 40–600 karakter untuk melengkapi kasus 12.
+  Konfirmasi label teks pada kartu balasan. Kasus yang hanya memiliki keputusan
+  situs tetap dikecualikan dari dataset pelatihan.
+- Keputusan disimpan bersama ID reviewer. Tekan /review untuk kasus berikutnya.
+  Perintah /cek tetap tersedia. Pelatihan memakai timer learning atau CLI learn.

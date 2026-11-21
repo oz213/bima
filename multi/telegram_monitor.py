@@ -201,6 +201,7 @@ HELP = (
     "/now - domain sedang di-HTTP / antre Selenium\n"
     "/recent [1-10] - hasil crawling terbaru\n"
     "/id - tampilkan chat ID untuk otorisasi\n"
+    "/review - verifikasi situs (reviewer pribadi)\n"
     "/help - daftar perintah"
 )
 
@@ -212,6 +213,9 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
         return f"Chat ID Anda: {chat_id}\nBerikan ID ini kepada admin bot untuk diizinkan."
     if chat_id not in allowed:
         return "Chat ini belum diizinkan. Kirim /id lalu daftarkan ID ke administrator."
+    if command in ('/review', '/bukti'):
+        from telegram_review import handle
+        return handle(text, chat_id, sender_id, allowed, db_path)
     if command == '/cek':
         if os.environ.get('TELEGRAM_CHECKS_ENABLED') != '1':
             return 'Fitur /cek belum diaktifkan.'
@@ -269,7 +273,7 @@ def get_updates(token, offset, poll_seconds=5, http_timeout=15):
         "offset": int(offset),
         "timeout": int(poll_seconds),
         "limit": 20,
-        "allowed_updates": json.dumps(["message"]),
+        "allowed_updates": json.dumps(["message", "callback_query"]),
     })
     req = Request(f"https://api.telegram.org/bot{token}/getUpdates?{params}", method="GET")
     with urlopen(req, timeout=max(int(http_timeout), int(poll_seconds) + 10)) as resp:
@@ -284,17 +288,35 @@ def send_message(token, chat_id, text):
 
     Do not print exception URLs: Bot token is part of the request path.
     """
-    params = urlencode({
-        'chat_id': chat_id,
-        'text': text[:3900],
-        'disable_web_page_preview': 'true',
-    })
+    data = text if isinstance(text, dict) else {"text": text}
+    fields = {"chat_id": chat_id, "text": data["text"][:3900], "disable_web_page_preview": "true"}
+    if "reply_markup" in data:
+        fields["reply_markup"] = json.dumps(data["reply_markup"])
+    params = urlencode(fields)
     request = Request(f'https://api.telegram.org/bot{token}/sendMessage?{params}', method='GET')
     with urlopen(request, timeout=15) as response:
         result = json.load(response)
     if not result.get('ok'):
         raise RuntimeError('Telegram sendMessage returned ok=false')
     return result.get('result')
+
+
+def handle_review_callback(token, query, allowed, db_path):
+    from telegram_review import handle
+    chat = (query.get("message") or {}).get("chat") or {}
+    sender = str((query.get("from") or {}).get("id", ""))
+    data = query.get("data") or ""
+    # A stale or already acknowledged callback must not block update replay.
+    params = urlencode({"callback_query_id": query.get("id", "")})
+    try:
+        with urlopen(f"https://api.telegram.org/bot{token}/answerCallbackQuery?{params}", timeout=10):
+            pass
+    except (OSError, TimeoutError):
+        pass
+    if chat.get("type") == "private" and data.startswith("br:"):
+        chat_id = str(chat["id"])
+        reply = handle(data, chat_id, sender, allowed, db_path, callback=True)
+        send_message(token, chat_id, reply)
 
 
 def deliver_checks(token, db_path, allowed):
@@ -393,6 +415,8 @@ def main():
                 LOGGER.info("Telegram updates diterima: %d", len(updates))
             for update in updates:
                 update_id = int(update["update_id"])
+                if update.get("callback_query"):
+                    handle_review_callback(token, update["callback_query"], allowed, db_path)
                 message = update.get("message") or {}
                 chat_id = str((message.get("chat") or {}).get("id", ""))
                 command = message.get("text", "")
