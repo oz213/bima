@@ -35,6 +35,19 @@ class TelegramReviewTests(unittest.TestCase):
         for chat, sender, allowed in [("-7", "42", {"-7"}), ("41", "41", {"41"}), ("42", "42", set())]:
             self.assertIn("reviewer", review.handle("br:1:yes", chat, sender, allowed, self.prod, True))
 
+    def test_existing_private_chat_can_review_without_secondary_list(self):
+        with patch.dict(os.environ):
+            os.environ.pop("TELEGRAM_REVIEW_USER_IDS", None)
+            self.assertIn("Judol", str(self.command("/review")))
+            self.assertIn("Keputusan situs: Judol", self.click("yes"))
+            for chat, sender, allowed in [("-7", "42", {"-7"}), ("42", "41", {"42"}),
+                                          ("41", "41", {"42"}), ("42", "42", set())]:
+                self.assertFalse(review.authorized(chat, sender, allowed))
+
+    def test_explicit_empty_reviewer_list_stays_closed(self):
+        with patch.dict(os.environ, {"TELEGRAM_REVIEW_USER_IDS": ""}):
+            self.assertFalse(review.authorized("42", "42", {"42"}))
+
     def test_site_then_independent_text(self):
         self.assertIn("Judol", str(self.command("/review")))
         self.assertIn("Keputusan situs: Judol", self.click("yes"))

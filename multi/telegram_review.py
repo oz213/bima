@@ -13,8 +13,10 @@ TEXT = {"pos": "gambling", "neg": "non_gambling", "skip": "not_for_training"}
 
 
 def authorized(chat, sender, allowed):
-    return (chat == sender and chat in allowed and chat.isascii() and chat.isdecimal()
-            and sender in os.getenv("TELEGRAM_REVIEW_USER_IDS", "").replace(",", " ").split())
+    if chat != sender or chat not in allowed or not chat.isascii() or not chat.isdecimal():
+        return False
+    reviewers = os.environ.get("TELEGRAM_REVIEW_USER_IDS")
+    return reviewers is None or sender in reviewers.replace(",", " ").split()
 
 
 def card(db, production, case_id=None, site_only=False):

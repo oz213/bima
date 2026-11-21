@@ -199,17 +199,11 @@ sudo journalctl -u pandi-learning.service -n 30 --no-pager
 
 ## v4.5.2 — Review lewat Telegram
 
-Di chat pribadi bot, kirim /id untuk memperoleh ID numerik. Pada server,
-jalankan `sudo systemctl edit pandi-telegram-monitor.service` dan tambahkan:
-
-```ini
-[Service]
-Environment=TELEGRAM_REVIEW_USER_IDS=123456789
-```
-
-Ganti angka dengan ID pribadi reviewer. Tambahkan ID pribadi tersebut juga ke
-TELEGRAM_ALLOWED_CHAT_IDS pada konfigurasi yang sudah dipakai monitor; pertahankan
-ID chat lain. BIMA_LEARNING_DB dapat diatur pada service monitor apabila learning
+Kirim /review di chat pribadi yang sudah diizinkan oleh TELEGRAM_ALLOWED_CHAT_IDS.
+Semua akun pribadi di daftar tersebut dapat memberi keputusan. Jika admin sudah
+menetapkan TELEGRAM_REVIEW_USER_IDS, daftar itu tetap membatasi reviewer.
+Grup hanya memiliki akses ke perintah monitor yang sudah diizinkan.
+BIMA_LEARNING_DB dapat diatur pada service monitor apabila learning
 menggunakan database selain multi/state/bima_learning_v450.sqlite3 milik checkout.
 
 Untuk menyertakan cuplikan pada kasus baru, gunakan
