@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
 from redirect_intelligence import analyze_html, build_redirect_chains
+from discovery_dns import audit_dns_failure
 import http.client
 import ipaddress
 import json
@@ -154,6 +155,27 @@ def load_seeds(input_filename: Path) -> tuple[list[str], str, int]:
         else:
             rejected += 1
     return list(unique), digest, rejected
+
+
+def stratified_seed_indices(total: int, size: int, digest: str,
+                            sample_seed: int = 0) -> list[int]:
+    """Deterministic, non-overlapping samples across the *ordered* seed list.
+
+    One entry per equal-sized index stratum; SHA-256 avoids dependency on
+    process-randomized hash(), Python's random implementation, or live DNS.
+    This is a dispersed sample, NOT a statistical sample of reachable websites.
+    """
+    if total <= 0 or size <= 0 or sample_seed < 0:
+        raise ValueError('total and size must be positive; sample seed nonnegative')
+    size = min(size, total)
+    result = []
+    for i in range(size):
+        lo = total * i // size
+        hi = total * (i + 1) // size
+        token = f'bima-v431:{digest}:{sample_seed}:{i}'.encode('ascii')
+        slot = int.from_bytes(hashlib.sha256(token).digest()[:8], 'big')
+        result.append(lo + slot % (hi - lo))
+    return result
 
 
 @dataclass(frozen=True)
@@ -1022,15 +1044,35 @@ def run(args) -> dict:
     seeds, digest, invalid = load_seeds(Path(args.input))
     if not seeds:
         raise ValueError('Tidak ada seed domain .id valid di urls.json')
+    selection = getattr(args, 'seed_selection', 'sequential')
+    dns_audit_limit = getattr(args, 'dns_audit_limit', 0)
+    # Enforce boundaries before opening DB, even for programmatic run(args).
+    if args.apply and (selection != 'sequential' or dns_audit_limit):
+        raise ValueError('stratified selection and DNS audits are preview-only')
+    if selection == 'stratified' and (args.start_index is not None or args.seed_limit > 100):
+        raise ValueError('stratified sampling does not accept start-index or over 100 seeds')
+    if not 0 <= dns_audit_limit <= 3:
+        raise ValueError('DNS audit limit must be between 0 and 3')
+    if dns_audit_limit and not args.scan_web:
+        raise ValueError('DNS auditing requires scan-web')
     conn = open_jobs_db(Path(args.db), apply=args.apply)
     try:
         saved_digest, saved_cursor = state_of(conn)
-        start = args.start_index if args.start_index is not None else (
-            saved_cursor if saved_digest == digest else 0)
-        start %= len(seeds)
         size = min(args.seed_limit, len(seeds))
-        current_seeds = [seeds[(start + i) % len(seeds)] for i in range(size)]
-        next_cursor = (start + size) % len(seeds)
+        if selection == 'stratified':
+            # Preview-only: deterministic across the inventory and explicitly
+            # unrelated to the sequential/apply cursor in SQLite.
+            start = None
+            next_cursor = None
+            selected_indices = stratified_seed_indices(
+                len(seeds), size, digest, getattr(args, 'sampling_seed', 0))
+        else:
+            start = args.start_index if args.start_index is not None else (
+                saved_cursor if saved_digest == digest else 0)
+            start %= len(seeds)
+            selected_indices = [(start + i) % len(seeds) for i in range(size)]
+            next_cursor = (start + size) % len(seeds)
+        current_seeds = [seeds[i] for i in selected_indices]
         before = pending_count(conn)
         # Keep the v4.2.1 default constructor unchanged (also for integrations
         # that provide their own SafeFetcher); opt in to advanced parsing.
@@ -1051,6 +1093,8 @@ def run(args) -> dict:
                  'js_dynamic_pages': 0}
         review_candidates: list[dict] = []
         seed_diagnostics: list[dict] = []
+        dns_audit_results: list[dict] = []
+        dns_status_counts: dict[str, int] = {}
         redirects_by_key: dict[tuple[str, str, str], RedirectObservation] = {}
         def observe_redirect(item: RedirectObservation):
             redirects_by_key[(item.source_url, item.destination_url, item.method)] = item
@@ -1082,8 +1126,19 @@ def run(args) -> dict:
                 http_fallback=getattr(args, 'http_fallback', False),
                 canonical_www=getattr(args, 'canonical_www', False),
                 browser_review_limit=getattr(args, 'browser_review_limit', 0))
+            diagnostic = counters['diagnostic']
+            if diagnostic.get('robots_outcome') == 'robots_dns':
+                if len(dns_audit_results) < dns_audit_limit:
+                    audit = audit_dns_failure(seed, timeout=getattr(args, 'dns_audit_timeout', 1.5))
+                    dns_audit_results.append(audit)
+                    dns_status = audit['dns_status']
+                else:
+                    dns_status = 'dns_resolution_failed_unverified'
+                dns_status_counts[dns_status] = dns_status_counts.get(dns_status, 0) + 1
+                if dns_audit_limit:
+                    diagnostic['dns_status'] = dns_status
             if len(seed_diagnostics) < getattr(args, 'diagnostic_seeds', 0):
-                seed_diagnostics.append(counters['diagnostic'])
+                seed_diagnostics.append(diagnostic)
             for k, v in counters.items():
                 if k == 'diagnostic':
                     continue
@@ -1118,13 +1173,22 @@ def run(args) -> dict:
             'mode': 'apply' if args.apply else 'preview',
             'seeds_total': len(seeds), 'seeds_this_run': len(current_seeds),
             'invalid_seed_entries': invalid, 'start_index': start,
-            'next_index': next_cursor, 'candidate_urls': len(ordered),
+            'next_index': next_cursor,
+            'seed_selection': selection,
+            'sampling_seed': getattr(args, 'sampling_seed', 0) if selection == 'stratified' else None,
+            'sampled_indices': selected_indices[:min(20, args.preview_samples)]
+                if selection == 'stratified' else [],
+            'candidate_urls': len(ordered),
             'new_jobs': new, 'held_candidates': held,
             'pending_before': before, 'pending_after': after,
             'scan_web': args.scan_web, 'ct': args.ct,
             'http_fallback': getattr(args, 'http_fallback', False),
             'canonical_www': getattr(args, 'canonical_www', False),
             'advanced_js': getattr(args, 'advanced_js', False), **stats,
+            'dns_failed_seeds': sum(dns_status_counts.values()),
+            'dns_audits_performed': len(dns_audit_results),
+            'dns_status_counts': dns_status_counts,
+            'preview_dns_audits': dns_audit_results if not args.apply else [],
             'preview_diagnostics': seed_diagnostics if not args.apply else [],
             'preview_browser_review': sorted(
                 {((item['source'], item['reason'], item['destination'] or '')): item
@@ -1171,7 +1235,16 @@ def arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ct', action='store_true', help='Optional crt.sh public CT lookup (sends seed hostname)')
     parser.add_argument('--apply', action='store_true', help='ENQUEUE jobs into crawler DB; may trigger BIMA alerts')
     parser.add_argument('--seed-limit', type=int, default=20)
-    parser.add_argument('--start-index', type=int, default=None, help='Preview offset override')
+    parser.add_argument('--seed-selection', choices=('sequential', 'stratified'),
+                        default='sequential',
+                        help='Opt-in stratified index sampling; preview only; no cursor movement')
+    parser.add_argument('--sampling-seed', type=int, default=0,
+                        help='Nonnegative repeatability key for stratified selection')
+    parser.add_argument('--start-index', type=int, default=None, help='Sequential offset override')
+    parser.add_argument('--dns-audit-limit', type=int, default=0,
+                        help='Opt-in: audit up to 3 DNS-failed seeds using existing dns_audit.py')
+    parser.add_argument('--dns-audit-timeout', type=float, default=1.5,
+                        help='Per DNS request timeout for bounded, read-only audit')
     parser.add_argument('--max-candidates-per-seed', type=int, default=30)
     parser.add_argument('--max-new', type=int, default=30)
     parser.add_argument('--max-pending', type=int, default=1000)
@@ -1216,6 +1289,21 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('timeout must be positive; interval/samples must be nonnegative')
     if args.start_index is not None and args.start_index < 0:
         raise SystemExit('start-index must be >= 0')
+    if not 0 <= args.sampling_seed <= 2147483647:
+        raise SystemExit('--sampling-seed must be between 0 and 2147483647')
+    if args.seed_selection == 'stratified':
+        if args.apply or args.start_index is not None:
+            raise SystemExit('--seed-selection stratified is preview-only and cannot use --start-index')
+        if args.seed_limit > 100:
+            raise SystemExit('stratified sampling limited to 100 seeds per preview')
+    elif args.sampling_seed:
+        raise SystemExit('--sampling-seed requires --seed-selection stratified')
+    if not 0 <= args.dns_audit_limit <= 3:
+        raise SystemExit('--dns-audit-limit must be between 0 and 3')
+    if args.dns_audit_limit and (not args.scan_web or args.apply):
+        raise SystemExit('--dns-audit-limit requires --scan-web and preview (no --apply)')
+    if not 0.2 <= args.dns_audit_timeout <= 3.0:
+        raise SystemExit('--dns-audit-timeout must be between 0.2 and 3.0 seconds')
     try:
         result = run(args)
     except (ValueError, OSError, sqlite3.Error, json.JSONDecodeError) as exc:
