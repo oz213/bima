@@ -235,3 +235,23 @@ sudo systemctl is-active pandi-telegram-monitor.service pandi-crawler-multi.serv
   situs tetap dikecualikan dari dataset pelatihan.
 - Keputusan disimpan bersama ID reviewer. Tekan /review untuk kasus berikutnya.
   Perintah /cek tetap tersedia. Pelatihan memakai timer learning atau CLI learn.
+
+## Analisis pola sebelum review Telegram
+
+Di chat pribadi yang telah diizinkan, /review mendahulukan kasus dengan bukti
+yang berulang lintas situs. /pola membuka satu kasus dalam kelompok yang cocok.
+Analisis berjalan saat kartu diminta, pada maksimal 500 kasus learning terbaru.
+Sinyal yang tersedia mencakup host akhir crawl berbeda dari host awal, observasi
+Discovery dengan URL sumber persis sama seperti job, dan frasa tiga kata dari
+600 karakter awal bukti. Host akhir tidak menjelaskan mekanisme perpindahan.
+Observasi HTTP dan petunjuk meta/JS ditampilkan terpisah. Waktu pengamatan
+Discovery dapat berbeda dari waktu crawl kasus. Jika produksi belum memiliki
+tabel observasi, bot menggunakan bukti di database learning.
+
+Ambang awal adalah tiga domain_group berbeda. Domain_group pada data lama
+dapat berupa hostname; beberapa subdomain dapat dimiliki satu registran.
+Pola berulang termasuk frasa umum. Kartu adalah petunjuk untuk verifikasi,
+tanpa kesimpulan tentang kebaruan historis atau pelanggaran pada semua anggota.
+Prioritas diberikan kepada pola dengan keputusan Judol sebelumnya, lalu gabungan
+tujuan dan frasa. Tombol Bukti belum cukup menunda kasus, dengan audit reviewer,
+tanpa label pelatihan. Untuk meninjau ulang gunakan /review ID.

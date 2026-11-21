@@ -1,4 +1,5 @@
 """Private Telegram incident decisions and independent text labels."""
+import json
 import os
 import re
 import sqlite3
@@ -6,7 +7,7 @@ from contextlib import closing
 from urllib.parse import urlsplit
 from pathlib import Path
 
-from learning import core
+from learning import core, patterns
 
 INCIDENT = {"yes": "true_positive", "no": "false_positive"}
 TEXT = {"pos": "gambling", "neg": "non_gambling", "skip": "not_for_training"}
@@ -19,12 +20,17 @@ def authorized(chat, sender, allowed):
     return reviewers is None or sender in reviewers.replace(",", " ").split()
 
 
-def card(db, production, case_id=None, site_only=False):
+def card(db, production, case_id=None, site_only=False, patterns_only=False):
     with core.learning_connection(db, production) as conn:
         sql = ("SELECT c.id,c.source_job_id,c.hostname,c.final_hostname,c.source_updated_at,"
-               "c.label,t.verdict,e.text_value FROM review_cases c "
+               "c.label,t.verdict,e.text_value,c.model_metadata_json FROM review_cases c "
                "LEFT JOIN telegram_incidents t ON t.case_id=c.id "
                "LEFT JOIN case_evidence e ON e.case_id=c.id ")
+        first, summaries = patterns.analyze(conn, production)
+        if case_id is None:
+            case_id = first
+        if patterns_only and case_id is None:
+            return "Belum ada kasus terbuka dengan pola lintas situs. Kirim /review untuk antrean biasa."
         if case_id is None:
             row = conn.execute(sql + "WHERE c.label IS NULL AND t.case_id IS NULL "
                                "ORDER BY c.id LIMIT 1").fetchone()
@@ -32,7 +38,7 @@ def card(db, production, case_id=None, site_only=False):
             row = conn.execute(sql + "WHERE c.id=?", (case_id,)).fetchone()
     if not row:
         return "Kasus tidak ditemukan." if case_id else "Antrean keputusan situs kosong."
-    key, job, host, final, when, label, verdict, evidence = row
+    key, job, host, final, when, label, verdict, evidence, metadata = row
     header = f"Kasus #{key} · job #{job}\nSitus: {host}\nTujuan: {final or host}\nWaktu crawl: {when or '-'}"
     source = Path(production).resolve()
     if source.is_file():
@@ -45,6 +51,16 @@ def card(db, production, case_id=None, site_only=False):
         decision = "Judol" if label == "true_positive" else "Bukan judol"
         return header + "\nKeputusan tersimpan: " + decision + ". /review untuk kasus berikutnya."
     body = header
+    if key in summaries:
+        body += "\n\n" + summaries[key]
+        try:
+            models = json.loads(metadata or "{}")
+        except (ValueError, TypeError):
+            models = {}
+        if isinstance(models, dict) and models.get("bert_used") is True:
+            prediction = models.get("indobert_pred")
+            if prediction in ("gambling", "non-gambling"):
+                body += "\nIndoBERT pada kasus ini: " + prediction
     if evidence:
         body += "\n\nCuplikan bukti:\n" + evidence[:600]
     if not verdict:
@@ -66,6 +82,8 @@ def card(db, production, case_id=None, site_only=False):
         body += "\nApakah teks bukti itu sendiri mempromosikan judi?"
         options = [("Ya", "pos"), ("Tidak", "neg"), ("Abaikan teks", "skip")]
     buttons = [[{"text": name, "callback_data": f"br:{key}:{action}"} for name, action in options]]
+    if not verdict and label != "needs_review":
+        buttons.append([{"text": "Bukti belum cukup", "callback_data": f"br:{key}:defer"}])
     return {"text": body, "reply_markup": {"inline_keyboard": buttons}}
 
 
@@ -78,6 +96,8 @@ def handle(text, chat, sender, allowed, production, callback=False):
         return "Konfigurasi database learning harus terpisah dari database crawler."
     parts = text.split(maxsplit=2)
     if not callback:
+        if parts[0].split("@")[0].lower() == "/pola":
+            return card(db, production, patterns_only=True)
         if parts[0].split("@")[0].lower() == "/review":
             if len(parts) == 1:
                 return card(db, production)
@@ -92,13 +112,27 @@ def handle(text, chat, sender, allowed, production, callback=False):
         except ValueError:
             return "Bukti tidak dapat disimpan. Periksa ID, bukti terdahulu, atau status final."
         return card(db, production, case_id)
-    match = re.fullmatch(r"br:([1-9][0-9]{0,17}):(yes|no|pos|neg|skip|bothpos|bothneg|site)", text)
+    match = re.fullmatch(r"br:([1-9][0-9]{0,17}):(yes|no|pos|neg|skip|bothpos|bothneg|site|defer)", text)
     if not match:
         return "Tombol review tidak valid."
     case_id, action = int(match[1]), match[2]
     if action == "site":
         return card(db, production, case_id, site_only=True)
     reviewer = "telegram:" + sender
+    if action == "defer":
+        with core.learning_connection(db, production) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE review_cases SET label='needs_review', reviewer=?,updated_at=? "
+                "WHERE id=? AND label IS NULL AND NOT EXISTS "
+                "(SELECT 1 FROM telegram_incidents WHERE case_id=?)",
+                (reviewer, core.utcnow(), case_id, case_id))
+            if changed.rowcount:
+                conn.execute("INSERT INTO review_events(case_id,event_type,reviewer,new_label,note,created_at) "
+                             "VALUES(?,?,?,?,?,?)", (case_id, "human_review", reviewer, "needs_review",
+                             "Bukti belum cukup", core.utcnow()))
+                return f"Kasus #{case_id} ditunda. /review untuk kasus berikutnya, /review {case_id} untuk membuka kembali."
+        return "Kasus sudah ditunda atau diputuskan."
     with core.learning_connection(db, production) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT label FROM review_cases WHERE id=?", (case_id,)).fetchone()

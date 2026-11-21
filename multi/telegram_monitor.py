@@ -201,6 +201,7 @@ HELP = (
     "/now - domain sedang di-HTTP / antre Selenium\n"
     "/recent [1-10] - hasil crawling terbaru\n"
     "/id - tampilkan chat ID untuk otorisasi\n"
+    "/pola - kasus dengan bukti berulang lintas situs\n"
     "/review - verifikasi situs (reviewer pribadi)\n"
     "/help - daftar perintah"
 )
@@ -213,7 +214,7 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
         return f"Chat ID Anda: {chat_id}\nBerikan ID ini kepada admin bot untuk diizinkan."
     if chat_id not in allowed:
         return "Chat ini belum diizinkan. Kirim /id lalu daftarkan ID ke administrator."
-    if command in ('/review', '/bukti'):
+    if command in ('/review', '/bukti', '/pola'):
         from telegram_review import handle
         return handle(text, chat_id, sender_id, allowed, db_path)
     if command == '/cek':
