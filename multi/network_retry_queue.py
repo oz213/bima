@@ -9,12 +9,14 @@ from __future__ import annotations
 from collections import deque
 
 from routine_queue import find_next_pending_job
+from discovery_priority import find_next_discovery_job, find_next_registry_job
 
 
 class RetryPacer:
-    """Reserve at most 1 in ``every`` routine slots for due retries.
+    """Reserve at most 1 in ``every`` non-Telegram slots for due retries.
 
-    The rolling one-minute cap also applies when no normal routine job exists.
+    Discovery and Registry dispatches both contribute to retry pacing.
+    The rolling one-minute cap also applies when no routine job exists.
     Interactive Telegram work is never counted against the routine quota.
     """
 
@@ -38,7 +40,7 @@ class RetryPacer:
 
     def record(self, kind: str, now: float) -> None:
         """Record a successfully claimed job. ``telegram`` does not affect quota."""
-        if kind == 'routine':
+        if kind in ('routine', 'discovery'):
             self.routines_since_retry += 1
         elif kind == 'retry':
             self.retry_times.append(now)
@@ -68,17 +70,28 @@ def find_due_network_retry(conn, now_utc: str, max_attempts: int):
 
 def choose_next_job(conn, last_id: int, *, interactive: bool, priority,
                     pacer: RetryPacer | None, now_utc: str, now_monotonic: float,
-                    max_attempts: int):
+                    max_attempts: int, discovery_pacer=None):
     """Choose (job, kind) without changing SQLite or the pending cursor.
 
-    Telegram is always first. If a routine row exists, retry is eligible only
-    after 4 routine selections (default) and subject to the rolling cap.
+    Telegram is first. Discovery precedes Registry within a fair 4:1 burst
+    limit; due retries keep their bounded pacing (typically 1 in 5 dispatches).
     """
     if priority is not None:
         return priority, 'telegram'
-    routine = find_next_pending_job(conn, last_id, wrap=interactive)
-    if pacer is not None and pacer.can_retry(now_monotonic, routine_available=routine is not None):
+    routine = find_next_registry_job(conn, last_id, wrap=interactive)
+    discovery = find_next_discovery_job(conn)
+    # Preserve BIMA's existing rate-limited due-retry cadence even during a
+    # Discovery burst. Telegram is always above both paths.
+    if pacer is not None and pacer.can_retry(
+            now_monotonic, routine_available=(routine is not None or discovery is not None)):
         due = find_due_network_retry(conn, now_utc, max_attempts)
         if due is not None:
             return due, 'retry'
-    return (routine, 'routine') if routine is not None else (None, 'none')
+    if discovery is not None and (discovery_pacer is None or
+                                  discovery_pacer.allow(routine_available=routine is not None)):
+        return discovery, 'discovery'
+    if routine is not None:
+        return routine, 'routine'
+    if discovery is not None:
+        return discovery, 'discovery'
+    return None, 'none'

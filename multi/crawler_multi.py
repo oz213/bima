@@ -34,6 +34,7 @@ import requests
 from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
 from routine_queue import find_next_pending_job
 from network_retry_queue import RetryPacer, choose_next_job
+from discovery_priority import DiscoveryPacer
 
 _HTTP_LOCAL = threading.local()
 _INFERENCE_LOCK = threading.Lock()
@@ -1011,6 +1012,7 @@ def run(args):
         if retry_pacer is not None:
             log(f'Auto network retry enabled: every={retry_pacer.every}, '
                 f'max_per_minute={retry_pacer.max_per_minute}')
+        discovery_pacer = DiscoveryPacer(max_burst=4)
         limit = args.limit or float('inf')
 
         def handle_browser_result(result):
@@ -1060,7 +1062,8 @@ def run(args):
                 row, kind = choose_next_job(
                     conn, last_id, interactive=interactive, priority=priority,
                     pacer=retry_pacer, now_utc=utcnow(), now_monotonic=now_mono,
-                    max_attempts=args.max_network_attempts)
+                    max_attempts=args.max_network_attempts,
+                    discovery_pacer=discovery_pacer)
                 if row is None:
                     return False
                 id_, url = row
@@ -1070,6 +1073,7 @@ def run(args):
                              "updated_at=? WHERE id=?", (utcnow(), id_))
                 if retry_pacer is not None:
                     retry_pacer.record(kind, now_mono)
+                discovery_pacer.record(kind)
             futures[pool.submit(fetch_http, engine, url, args)] = (id_, url)
             return True
 

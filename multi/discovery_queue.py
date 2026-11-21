@@ -20,6 +20,7 @@ import sys
 from urllib.parse import urlsplit
 
 from google_discovery import load_scopes, normalize_candidate
+from discovery_priority import PRIORITY_SCHEMA, has_priority_table, pending_priority_count, cleanup_finished_priorities
 
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 2 * 1024 * 1024
@@ -116,10 +117,12 @@ def _read_log(path, scopes):
                         continue
                     if len(unique) >= MAX_CANDIDATES:
                         raise QueueImportError('Too many unique candidates; rotate/archive JSONL')
-                    unique[raw] = None
+                    # Trust only the already-whitelisted provider list; Brave
+                    # is never imported or stored from older mixed-source logs.
+                    unique[raw] = 'google' if 'google' in sources else 'urlscan'
     except OSError:
         raise QueueImportError('Discovery JSONL read failure; no writes made') from None
-    return list(unique), counters
+    return list(unique.items()), counters
 
 
 def _db_connection(path, apply):
@@ -174,11 +177,23 @@ def _queue_keys(url):
     return (url,)
 
 
-def _job_exists(conn, url):
+def _find_existing(conn, url):
     keys = _queue_keys(url)
     if len(keys) == 1:
-        return conn.execute('SELECT 1 FROM jobs WHERE url=? LIMIT 1', keys).fetchone() is not None
-    return conn.execute('SELECT 1 FROM jobs WHERE url IN (?,?) LIMIT 1', keys).fetchone() is not None
+        return conn.execute('SELECT id,status FROM jobs WHERE url=? LIMIT 1', keys).fetchone()
+    return conn.execute(
+        'SELECT id,status FROM jobs WHERE url IN (?,?) ORDER BY id LIMIT 1', keys
+    ).fetchone()
+
+
+def _job_exists(conn, url):
+    return _find_existing(conn, url) is not None
+
+
+def _is_prioritized(conn, job_id):
+    return conn.execute(
+        'SELECT 1 FROM discovery_job_priority WHERE job_id=?', (job_id,)
+    ).fetchone() is not None
 
 
 def _pending(conn):
@@ -188,8 +203,10 @@ def _pending(conn):
 def audit(args):
     if args.apply and not args.acknowledge_queue_write:
         raise QueueImportError('--apply requires --acknowledge-queue-write')
-    if args.max_pending < 1 or args.max_pending > 3000000 or not 1 <= args.max_new <= 100:
-        raise QueueImportError('max-pending must be 1..3000000 and max-new 1..100')
+    if (args.max_pending < 1 or args.max_pending > 3000000
+            or not 1 <= args.max_new <= 100
+            or not 1 <= getattr(args, 'max_priority', 20) <= 100):
+        raise QueueImportError('max-pending must be 1..3000000; max-new and max-priority 1..100')
     scopes = load_scopes(args.domains)
     candidates, counters = _read_log(args.input, scopes)
     if Path(args.db).resolve() == Path(args.input).resolve():
@@ -202,54 +219,104 @@ def audit(args):
         'providers_ingested': ['google', 'urlscan'],
         'brave_ingestion_enabled': False, 'discovery_only': not args.apply,
         'max_new': args.max_new, 'max_pending': args.max_pending,
+        'max_priority': getattr(args, 'max_priority', 20),
+        'priority_backlog_override': bool(getattr(args, 'allow_priority_over_pending_ceiling', False)),
+        'prioritization': 'telegram > discovery > routine (fair, with bounded retries)',
         'unique_valid_candidates': len(candidates), **counters,
     }
     with closing(_db_connection(args.db, args.apply)) as conn:
         if not args.apply:
             pending = _pending(conn)
+            known_priority_table = has_priority_table(conn)
             missing = 0
             existing = 0
-            for url in candidates:
-                if _job_exists(conn, url):
-                    existing += 1
-                else:
+            promotable_pending = 0
+            for url, _provider in candidates:
+                job = _find_existing(conn, url)
+                if job is None:
                     missing += 1
-            capacity = max(0, min(args.max_new, args.max_pending - pending))
+                else:
+                    existing += 1
+                    if job[1] == 'pending' and (not known_priority_table or not _is_prioritized(conn, job[0])):
+                        promotable_pending += 1
+            capacity = (args.max_new if getattr(args, 'allow_priority_over_pending_ceiling', False)
+                        else max(0, min(args.max_new, args.max_pending - pending)))
+            available_priority = max(0, getattr(args, 'max_priority', 20) -
+                                     (pending_priority_count(conn) if known_priority_table else 0))
+            # Existing pending jobs can be promoted without inflating backlog.
+            # New inserts are bounded by both the pending ceiling and lane cap.
+            possible_promotions = min(promotable_pending, available_priority)
             result.update({
                 'pending_before': pending, 'pending_after': pending,
                 'already_in_jobs': existing, 'not_in_jobs': missing,
-                'would_insert': min(missing, capacity),
+                'existing_pending_promotable': promotable_pending,
+                'would_promote_existing': possible_promotions,
+                'would_insert': min(missing, capacity,
+                                    max(0, available_priority - possible_promotions)),
+                'pending_discovery_priority': pending_priority_count(conn),
                 'blocked_by_pending_limit': pending >= args.max_pending,
             })
             return result
-        # The transaction serializes all writers, including a live crawler.
+        # Hold one IMMEDIATE transaction for both jobs and priority metadata.
         # Never modify existing jobs' status, attempts, results or timestamps.
         with conn:
             conn.execute('BEGIN IMMEDIATE')
             pending = _pending(conn)
             result['pending_before'] = pending
+            conn.execute(PRIORITY_SCHEMA)
+            removed_finished = cleanup_finished_priorities(conn)
+            lane_before = pending_priority_count(conn)
+            lane_capacity = max(0, getattr(args, 'max_priority', 20) - lane_before)
             inserted = 0
             existing = 0
-            if pending < args.max_pending:
-                timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                for url in candidates:
-                    if inserted >= args.max_new or pending >= args.max_pending:
-                        break
-                    if _job_exists(conn, url):
-                        existing += 1
+            promoted_existing = 0
+            priority_added = 0
+            timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            # Existing pending Registry URLs found by Google can take priority
+            # without duplicating the job or changing its prior verdict.
+            for url, provider in candidates:
+                if priority_added >= lane_capacity:
+                    break
+                job = _find_existing(conn, url)
+                if job is not None:
+                    existing += 1
+                    job_id, status = job
+                    if status != 'pending' or _is_prioritized(conn, job_id):
                         continue
                     cursor = conn.execute(
-                        'INSERT OR IGNORE INTO jobs(url,updated_at) VALUES (?,?)',
-                        (url, timestamp),
-                    )
+                        'INSERT OR IGNORE INTO discovery_job_priority(job_id,provider,discovered_at) '
+                        'VALUES (?,?,?)', (job_id, provider, timestamp))
                     if cursor.rowcount:
-                        inserted += 1
-                        pending += 1
-                    else:
-                        existing += 1
+                        priority_added += 1
+                        promoted_existing += 1
+                    continue
+                if (inserted >= args.max_new or
+                        (pending >= args.max_pending and
+                         not getattr(args, 'allow_priority_over_pending_ceiling', False))):
+                    continue
+                cursor = conn.execute(
+                    'INSERT OR IGNORE INTO jobs(url,updated_at) VALUES (?,?)',
+                    (url, timestamp),
+                )
+                if not cursor.rowcount:
+                    existing += 1
+                    continue
+                job_id = cursor.lastrowid
+                conn.execute(
+                    'INSERT INTO discovery_job_priority(job_id,provider,discovered_at) '
+                    'VALUES (?,?,?)', (job_id, provider, timestamp))
+                inserted += 1
+                pending += 1
+                priority_added += 1
             result.update({
                 'new_jobs': inserted, 'db_writes': inserted,
+                'priority_metadata_writes': priority_added,
                 'pending_after': pending, 'already_in_jobs_scanned': existing,
+                'promoted_existing_pending': promoted_existing,
+                'priority_added': priority_added,
+                'pending_discovery_priority_before': lane_before,
+                'pending_discovery_priority_after': pending_priority_count(conn),
+                'finished_priority_cleaned': removed_finished,
                 'blocked_by_pending_limit': pending >= args.max_pending,
             })
     return result
@@ -263,7 +330,11 @@ def make_parser():
     p.add_argument('--domains', default='domains.json')
     p.add_argument('--max-new', type=int, default=20)
     p.add_argument('--max-pending', type=int, default=10000,
-                   help='Backpressure guard; large Registry backlogs may prevent imports')
+                   help='Backpressure guard; large Registry backlogs may prevent new jobs')
+    p.add_argument('--max-priority', type=int, default=20,
+                   help='Maximum active pending Discovery priority jobs (1..100)')
+    p.add_argument('--allow-priority-over-pending-ceiling', action='store_true',
+                   help='EXPLICIT: bounded Discovery inserts even if Registry pending exceeds max-pending')
     p.add_argument('--apply', action='store_true', help='Insert a bounded number of new jobs')
     p.add_argument('--acknowledge-queue-write', action='store_true',
                    help='Confirm an intentional write to live crawler jobs')
