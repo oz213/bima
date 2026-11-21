@@ -1,5 +1,7 @@
 # BIMA v4.3.4 — Multi-Source Domain Discovery (Preview Only)
 
+> **Update:** For installations upgraded to v4.3.5, Brave results are no longer persisted and daily Brave calls are disabled by default. Read `README_DISCOVERY_V435.md` for the current quota and legal-use gate. This v4.3.4 document describes the historical release.
+
 ## Goal and safety
 
 Use **14 suffix scopes** from the existing untracked `domains.json` to find candidate `.id` URLs through separate search intelligence providers, preserving the existing keywords **`slot OR gacor`** from `config.json`. **Do not** run the old `crawler_google.py` as part of this workflow: it launches legacy Selenium (`--no-sandbox`) and can send BIMA alerts.

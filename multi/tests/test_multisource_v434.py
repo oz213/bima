@@ -45,7 +45,9 @@ class Fixture(unittest.TestCase):
             max_google_requests=3, max_brave_requests=3,
             max_urlscan_requests=3, results_per_request=5,
             preview_limit=500, timeout=8.0, request_interval=0.0,
-            state_file='', execute=False, acknowledge_quota=False)
+            state_file='', execute=False, acknowledge_quota=False,
+            brave_monthly_ledger=str(root / 'brave-quota.json'),
+            brave_monthly_request_cap=900)
         self.now = datetime(2026, 11, 21, 6, tzinfo=timezone.utc)
 
     def discover(self, providers=None):
@@ -264,14 +266,16 @@ class ExecutionTests(Fixture):
         self.assertEqual(output['raw_results'], 8)
         self.assertEqual(output['valid_results'], 3)
         self.assertEqual(output['outside_scope_or_invalid'], 2)
-        self.assertEqual(output['duplicate_results'], 3)
+        self.assertEqual(output['duplicate_results'], 1)
+        self.assertEqual(output['brave_transient_valid_results'], 2)
+        self.assertEqual(output['brave_transient_unique_results'], 2)
         self.assertEqual(output['new_jobs'], 0)
         self.assertEqual(output['alerts_sent'], 0)
         self.assertEqual(output['db_writes'], 0)
         self.assertFalse(output['browser_launched'])
         recs = {r['url']: r for r in output['preview_candidates']}
-        self.assertEqual(recs['https://x.co.id/slot']['sources'], ['google', 'brave'])
-        self.assertEqual(recs['https://y.co.id/gacor']['sources'], ['brave', 'urlscan'])
+        self.assertEqual(recs['https://x.co.id/slot']['sources'], ['google'])
+        self.assertEqual(recs['https://y.co.id/gacor']['sources'], ['urlscan'])
         self.assertEqual(recs['https://z.co.id/a']['evidence_level'], 'historical_scan_metadata')
         self.assertNotIn('SECRET_URL', json.dumps(output))
         self.assertNotIn('private=123', json.dumps(output))
@@ -304,7 +308,8 @@ class ExecutionTests(Fixture):
         self.assertEqual(d['api_requests'], 3)
         self.assertIn('429', d['providers']['google']['error'])
         self.assertEqual(d['providers']['brave']['status'], 'ok')
-        self.assertEqual(d['new_candidates'], 1)
+        self.assertEqual(d['new_candidates'], 0)
+        self.assertEqual(d['brave_transient_unique_results'], 1)
 
     def test_non_curated_exception_redacted(self):
         self.domains.write_text(json.dumps({'domains': ['.co.id']}))

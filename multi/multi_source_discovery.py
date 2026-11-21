@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BIMA v4.3.4: bounded, multi-provider .id discovery, preview-only.
+"""BIMA v4.3.5: bounded, multi-provider .id discovery, preview-only.
 
 Google CSE, Brave Search, and urlscan.io are read-only sources.  The only
 persistent option is an explicit, local hash-based deduplication state file.
@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 
+from brave_quota import BraveQuotaError, reserve_request
 from google_discovery import (
     GoogleCSEProvider, GoogleDiscoveryError, GOOGLE_CSE_END,
     best_scope, clean_keywords, google_query, load_scopes,
@@ -88,7 +89,7 @@ def _bounded_json(session, provider, endpoint, params, headers, timeout):
 def _session():
     import requests
     session = requests.Session()
-    session.headers.update({'User-Agent': 'PANDI-BIMA-Discovery/4.3.4'})
+    session.headers.update({'User-Agent': 'PANDI-BIMA-Discovery/4.3.5'})
     return session
 
 
@@ -222,7 +223,9 @@ def write_state(path, seen):
 def provider_keys(config):
     return {
         'google': (resolve_secret(config, 'GOOGLE_API_KEY'), resolve_secret(config, 'GOOGLE_CX')),
-        'brave': (resolve_secret(config, 'BRAVE_SEARCH_API_KEY'),),
+        # An environment-only secret is supported; no change to config.json is needed.
+        'brave': (resolve_secret(config, 'BRAVE_SEARCH_API_KEY') or
+                  os.environ.get('BRAVE_SEARCH_API_KEY', '').strip(),),
         'urlscan': (resolve_secret(config, 'URLSCAN_API_KEY'),),
     }
 
@@ -251,7 +254,7 @@ def discover(args, providers=None, now=None):
                'urlscan': args.max_urlscan_requests}
     result = {
         'ok': True, 'mode': 'api_preview' if args.execute else 'plan',
-        'version': '4.3.4', 'scopes_total': len(scopes),
+        'version': '4.3.5', 'scopes_total': len(scopes),
         'scopes': ['.' + s for s in scopes],
         'keywords_used': keywords, 'date_utc': day.isoformat(),
         'api_requests': 0, 'successful_requests': 0,
@@ -264,6 +267,10 @@ def discover(args, providers=None, now=None):
         'browser_launched': False,
         'discovery_only': True,
         'provider_deprecation': 'Google CSE: 2027-01-01',
+        # Brave URL responses are transient. Only aggregate counts are returned.
+        'brave_transient_valid_results': 0,
+        'brave_transient_unique_results': 0,
+        'brave_monthly_request_cap': getattr(args, 'brave_monthly_request_cap', 900),
     }
     calls = {}
     for name in chosen:
@@ -279,6 +286,8 @@ def discover(args, providers=None, now=None):
             'raw_results': 0, 'valid_results': 0,
             'error': None, 'scopes_this_run': [x['scope'] for x in items],
             'expired': expired,
+            'quota_reserved_this_run': 0,
+            'transient_only': name == 'brave',
         }
         result['planned_queries'].extend(
             [{'provider': name, **x} for x in items])
@@ -290,6 +299,8 @@ def discover(args, providers=None, now=None):
     prior = read_state(args.state_file)
     seen = OrderedDict((h, None) for h in prior)
     unique = OrderedDict()
+    # Discard this set at process exit; it never enters logs or the state file.
+    brave_unique = set()
     for name in chosen:
         details = result['providers'][name]
         if details['expired']:
@@ -298,9 +309,28 @@ def discover(args, providers=None, now=None):
         if not details['configured']:
             details['status'] = 'skipped_missing_credentials'
             continue
+        if name == 'brave' and not getattr(args, 'brave_monthly_ledger', ''):
+            details['status'] = 'skipped_missing_quota_ledger'
+            continue
         adapter = make_provider(name, secrets[name], args.timeout, injected=providers)
         details['status'] = 'ok'
         for idx, item in enumerate(calls[name]):
+            if name == 'brave':
+                try:
+                    allowed, _ = reserve_request(
+                        args.brave_monthly_ledger,
+                        getattr(args, 'brave_monthly_request_cap', 900),
+                        now=now)
+                except (BraveQuotaError, OSError) as exc:
+                    details['status'] = 'error'
+                    details['error'] = (str(exc) if isinstance(exc, BraveQuotaError)
+                                        else 'Brave quota ledger IO failure')
+                    result['ok'] = False
+                    break
+                if not allowed:
+                    details['status'] = 'skipped_monthly_cap'
+                    break
+                details['quota_reserved_this_run'] += 1
             result['api_requests'] += 1
             details['requests'] += 1
             try:
@@ -329,11 +359,16 @@ def discover(args, providers=None, now=None):
                     continue
                 canonical, matched = normalized
                 details['valid_results'] += 1
+                if name == 'brave':
+                    # Brave terms permit transient operational use, not a
+                    # persistent search-result database. Never output or hash
+                    # URLs from Brave into the state cache or JSONL.
+                    result['brave_transient_valid_results'] += 1
+                    brave_unique.add(canonical)
+                    continue
                 if canonical in unique:
                     result['duplicate_results'] += 1
                     record = unique[canonical]
-                    if name not in record['sources']:
-                        record['sources'].append(name)
                     if item['scope'] not in record['found_via_scopes']:
                         record['found_via_scopes'].append(item['scope'])
                     continue
@@ -348,6 +383,7 @@ def discover(args, providers=None, now=None):
             if idx + 1 < len(calls[name]) and args.request_interval:
                 time.sleep(args.request_interval)
     result['valid_results'] = len(unique)
+    result['brave_transient_unique_results'] = len(brave_unique)
     novel = []
     for url, record in unique.items():
         digest = hash_url(url)
@@ -361,7 +397,7 @@ def discover(args, providers=None, now=None):
     result['preview_truncated'] = len(novel) > args.preview_limit
     # Only persist hashes for candidates actually emitted in JSON output.
     # This prevents irreversible loss of unseen, truncated candidates.
-    if args.state_file and result['successful_requests']:
+    if args.state_file and result['preview_candidates']:
         known = OrderedDict((h, None) for h in prior)
         for rec in result['preview_candidates']:
             known[hash_url(rec['url'])] = None
@@ -371,7 +407,7 @@ def discover(args, providers=None, now=None):
 
 
 def make_parser():
-    p = argparse.ArgumentParser(description='BIMA v4.3.4 Multi-Source Discovery: safe plan by default')
+    p = argparse.ArgumentParser(description='BIMA v4.3.5 Multi-Source Discovery: safe plan by default')
     p.add_argument('--domains', default='domains.json')
     p.add_argument('--config', default='config.json')
     p.add_argument('--providers', default='google,brave,urlscan')
@@ -379,6 +415,10 @@ def make_parser():
     p.add_argument('--max-keywords', type=int, default=6)
     p.add_argument('--max-google-requests', type=int, default=2)
     p.add_argument('--max-brave-requests', type=int, default=2)
+    p.add_argument('--brave-monthly-ledger', default='',
+                   help='Private per-month attempt ledger (required for Brave execution)')
+    p.add_argument('--brave-monthly-request-cap', type=int, default=900,
+                   help='Local Brave reservation ceiling; 900 recommended; <=1000')
     p.add_argument('--max-urlscan-requests', type=int, default=2)
     p.add_argument('--results-per-request', type=int, default=5)
     p.add_argument('--preview-limit', type=int, default=500)
@@ -397,6 +437,7 @@ def main(argv=None):
         if not (1 <= args.scope_limit <= 100 and 1 <= args.max_keywords <= 10
                 and all(1 <= x <= 14 for x in (args.max_google_requests,
                          args.max_brave_requests, args.max_urlscan_requests))
+                and 1 <= args.brave_monthly_request_cap <= 1000
                 and 1 <= args.results_per_request <= 10
                 and 0 <= args.preview_limit <= 500
                 and 2.0 <= args.timeout <= 15.0
