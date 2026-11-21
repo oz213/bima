@@ -5043,6 +5043,52 @@ def has_slot_thailand_registration(page_title, page_html, current_url):
     return False
 
 
+def is_anti_gambling_rejection_context(page_text, page_title="", page_html=None, current_url=""):
+    """Recognize an explicit refusal of gambling business, not a domain allowlist.
+
+    Only use this for a contextual-phrase medium-risk decision with a
+    non-gambling ML prediction. Strong operator marketing or hidden links
+    always veto the exemption. The existing IndoBERT call remains unchanged.
+    """
+    if not isinstance(page_text, str) or len(page_text) < 40:
+        return False
+    text = re.sub(r"\s+", " ", page_text[:30000].lower())
+    rejection = (
+        r"\b(?:tanpa|bebas|anti|menolak|melarang|dilarang|"
+        r"tidak\s+(?:menerima|melayani|mengizinkan|memfasilitasi|menyediakan))"
+        r"\b[^.!?]{0,110}\b(?:judi|judol|togel|casino)\b",
+        r"\b(?:judi|judol|togel|casino)\b[^.!?]{0,110}"
+        r"\b(?:ditolak|dilarang|diblokir|tidak\s+diterima|"
+        r"tidak\s+diizinkan|tidak\s+diperbolehkan|tidak\s+dilayani|kami\s+tolak)\b",
+    )
+    if not any(re.search(pattern, text) for pattern in rejection):
+        return False
+
+    # A legal disclaimer must not erase actual gambling promotion elsewhere.
+    promotions = (
+        r"\b(?:slot\s+gacor|rtp\s+slot|bonus\s+new\s+member|"
+        r"deposit\s+(?:slot|qris|dana)|togel\s+online|casino\s+online|"
+        r"link\s+alternatif\s+(?:judi|slot)|maxwin|mahjong\s+ways|"
+        r"gates\s+of\s+olympus|pragmatic\s+play)\b",
+        r"\b(?:main|bermain|pasang|taruhan|klaim|spin)\b"
+        r"[^.!?]{0,60}\b(?:slot|judi|togel|casino)\b",
+        r"\b(?:slot|judi|togel|casino)\b[^.!?]{0,60}"
+        r"\b(?:daftar\s+sekarang|login\s+sekarang|main\s+sekarang|"
+        r"klaim\s+bonus|pasang\s+sekarang)\b",
+    )
+    if any(re.search(pattern, text) for pattern in promotions):
+        return False
+
+    # Never suppress an existing hidden gambling-link signal. Fail closed.
+    try:
+        html = page_html() if callable(page_html) else page_html
+        if html and has_hidden_gambling_links(html, page_url=current_url)[0]:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, ml_source="classic_ml", page_title="", page_html=None, current_url=""):
 
     text_hits = find_keyword_hits(page_text, STRONG_TEXT_KEYWORDS)
@@ -5224,6 +5270,13 @@ def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, m
 
     if contextual_phrase_hit and (hard_count >= 1 or weak_count >= 2):
 
+
+        # A business anti-judol policy is not an advertisement when the
+        # classifier itself predicts non-gambling and no promo/hidden link is
+        # present. This guard applies ONLY to the contextual medium-risk rule.
+        if (ml_pred == "non-gambling" and is_anti_gambling_rejection_context(
+                page_text, page_title, page_html, current_url)):
+            return "low_risk", "anti_gambling_rejection_context", text_hits
         return "medium_risk", "contextual_gambling_phrase_detected", text_hits
 
 
