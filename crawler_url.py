@@ -1352,6 +1352,22 @@ def requests_session():
 
 
 
+def alert_requests_session():
+    """Isolate BIMA credentials and make a single transport attempt per alert.
+
+    A timeout or error response can arrive after the endpoint has accepted an
+    alert. Leave reconciliation to pending_alert instead of replaying the POST.
+    Keep environment proxy and CA settings for the configured BIMA endpoint.
+    """
+    session = requests.Session()
+    retries = Retry(total=0, connect=0, read=0, status=0, redirect=0,
+                    other=0, raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=1, pool_maxsize=1)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 session_http = requests_session()
 
 
@@ -5007,9 +5023,11 @@ def has_safe_context_without_real_gambling(text):
 def has_strong_operator_gambling_promo(page_text, page_title=""):
     """Check multiple independent signals for explicit operator-style promotion."""
     title = normalize_text_for_match(page_title)
-    body = normalize_text_for_match(page_text)
     title_promo = (re.search(r"\bspin\b", title) is not None
                    and re.search(r"\bmenang\b", title) is not None)
+    if not title_promo:
+        return False
+    body = normalize_text_for_match(page_text)
     account_calls = (re.search(r"\blogin\b", body) is not None
                      and re.search(r"\bdaftar\b", body) is not None)
     terms = ("deposit", "jackpot", "rtp", "link alternatif")
@@ -5158,7 +5176,9 @@ def is_blocklist_reporting_context(page_text, page_title, page_html, current_url
     return True
 
 
-def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, ml_source="classic_ml", page_title="", page_html=None, current_url=""):
+def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False,
+                  ml_source="classic_ml", page_title="", page_html=None, current_url="",
+                  *, operator_promo=None, slot_registration=None):
 
     text_hits = find_keyword_hits(page_text, STRONG_TEXT_KEYWORDS)
 
@@ -5278,9 +5298,13 @@ def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, m
 
     # Contoh: Kompas/Humas Polri membahas "judi slot" sebagai isu kriminal.
 
-    if safe_news_context:
-
-        return "low_risk", "safe_news_or_factcheck_context", text_hits
+    if operator_promo is None:
+        operator_promo = has_strong_operator_gambling_promo(page_text, page_title)
+    if safe_news_context and not operator_promo:
+        if slot_registration is None:
+            slot_registration = has_slot_thailand_registration(page_title, page_html, current_url)
+        if not slot_registration:
+            return "low_risk", "safe_news_or_factcheck_context", text_hits
 
 
 
@@ -5293,7 +5317,7 @@ def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, m
     if (ml_source == "indobert"
             and ml_pred == "gambling"
             and ml_conf >= strong_threshold
-            and has_strong_operator_gambling_promo(page_text, page_title)):
+            and operator_promo):
         return "high_risk", "strong_operator_gambling_promotion", text_hits
 
     if safe_product_context and not real_gambling_context and not contextual_phrase_hit:
@@ -5318,7 +5342,9 @@ def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, m
 
 
 
-        if has_slot_thailand_registration(page_title, page_html, current_url):
+        if slot_registration is None:
+            slot_registration = has_slot_thailand_registration(page_title, page_html, current_url)
+        if slot_registration:
             return "high_risk", "ml_strong_slot_thailand_registration", text_hits + ["slot thailand", "registration link"]
 
         return "low_risk", "ml_strong_but_no_real_gambling_context", text_hits
@@ -5434,29 +5460,12 @@ def classify_text_content(source, url, page_text, page_title, current_url, page_
 
 
 
-    if has_safe_news_or_factcheck_context(full_context_text):
-
-        log(
-
-            f"[DEBUG] source={source}, safe_context=safe_news_or_factcheck, "
-
-            f"title={page_title}, current_url={current_url}, text_len={len(page_text or '')}"
-
-        )
-
-        return make_low_risk_result(
-
-            captcha_hit,
-
-            kw_hit,
-
-            reason="safe_news_or_factcheck_context",
-
-        )
-
-
+    operator_promo = None
+    slot_registration = None
 
     safe_checks = [
+        ("news_or_factcheck", lambda text, title: has_safe_news_or_factcheck_context(full_context_text),
+         "safe_news_or_factcheck_context"),
 
         ("news_anti_gambling", is_safe_news_anti_gambling_context, "safe_news_anti_gambling_context"),
 
@@ -5487,6 +5496,16 @@ def classify_text_content(source, url, page_text, page_title, current_url, page_
     for safe_name, checker, reason in safe_checks:
 
         if checker(page_text, page_title):
+            # The first two checks cover news/fact-check and anti-gambling news.
+            # Media comes last, so check it before accepting an intervening
+            # exemption (e.g. a store). Keep the original reason if there is
+            # no conflicting operator or registration evidence.
+            if safe_name.startswith("news_") or is_safe_news_media_context(page_text, page_title):
+                operator_promo = has_strong_operator_gambling_promo(page_text, page_title)
+                if not operator_promo:
+                    slot_registration = has_slot_thailand_registration(page_title, page_html, current_url)
+                if operator_promo or slot_registration:
+                    break
 
             log(
 
@@ -5574,6 +5593,8 @@ def classify_text_content(source, url, page_text, page_title, current_url, page_
         page_title=page_title,
         page_html=page_html,
         current_url=current_url,
+        operator_promo=operator_promo,
+        slot_registration=slot_registration,
 
     )
 
@@ -7341,6 +7362,7 @@ def send_alert(url, screenshot_png_b64, confidence):
 
 
     response = None
+    alert_client = None
 
 
 
@@ -7368,7 +7390,8 @@ def send_alert(url, screenshot_png_b64, confidence):
 
 
 
-        response = session_http.post(
+        alert_client = alert_requests_session()
+        response = alert_client.post(
 
             ENDPOINT_URL,
 
@@ -7377,6 +7400,8 @@ def send_alert(url, screenshot_png_b64, confidence):
             json=payload,
 
             timeout=(ALERT_CONNECT_TIMEOUT, ALERT_READ_TIMEOUT),
+
+            allow_redirects=False,
 
         )
 
@@ -7492,6 +7517,12 @@ def send_alert(url, screenshot_png_b64, confidence):
 
             except Exception:
 
+                pass
+
+        if alert_client is not None:
+            try:
+                alert_client.close()
+            except Exception:
                 pass
 
 

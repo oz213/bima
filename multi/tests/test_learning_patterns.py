@@ -65,6 +65,32 @@ class PatternReviewTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM review_events").fetchone()[0], 2)
             self.assertEqual(conn.execute("SELECT label,text_label FROM review_cases WHERE id=4").fetchone(), (None,None))
 
+    def test_pattern_cards_show_examples_from_their_own_group(self):
+        self.add(1, "solo.id", evidence="Laporan kondisi cuaca saat perjalanan akhir pekan.")
+        for key, domain in enumerate(("mango.id", "apple.id", "peach.id"), start=2):
+            self.add(key, domain, evidence="Klaim bonus anggota sekarang dengan penawaran khusus.")
+        for key, domain in enumerate(("zebra.id", "trout.id", "salmon.id", "bass.id"), start=5):
+            self.add(key, domain, evidence="Informasi lokasi kantor dan jam operasional cabang.")
+        self.click(2, "yes")
+        self.click(5, "no")
+
+        with self.subTest(group="confirmed group"):
+            text = self.cmd("/pola")["text"]
+            self.assertIn("Kasus #3", text)
+            self.assertIn("Dugaan pola lintas situs · 3 kelompok domain", text)
+            self.assertIn("Kelompok dengan keputusan Judol: 1 · Bukan judol: 0", text)
+            self.assertIn("Contoh kelompok: apple.id, mango.id, peach.id", text.splitlines())
+
+        for key in (3, 4):
+            self.click(key, "defer")
+
+        with self.subTest(group="next group"):
+            text = self.cmd("/pola")["text"]
+            self.assertIn("Kasus #6", text)
+            self.assertIn("Dugaan pola lintas situs · 4 kelompok domain", text)
+            self.assertIn("Kelompok dengan keputusan Judol: 0 · Bukan judol: 1", text)
+            self.assertIn("Contoh kelompok: bass.id, salmon.id, trout.id", text.splitlines())
+
     def test_separate_group_count_and_static_method(self):
         for key in (1,2,3):
             self.add(key, "same.id", "js_literal")

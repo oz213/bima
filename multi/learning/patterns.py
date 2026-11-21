@@ -81,6 +81,7 @@ def analyze(conn, production):
     summaries = {}
     first = None
     for _, signals, size, yes, no, members in ranked:
+        domains = {domain for _, domain, _ in members}
         examples = ", ".join(sorted(domains)[:3])
         for key, _, verdict in reversed(members):
             if key not in summaries:
