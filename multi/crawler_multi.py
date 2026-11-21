@@ -33,6 +33,7 @@ import requests
 
 from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
 from routine_queue import find_next_pending_job
+from network_retry_queue import RetryPacer, choose_next_job
 
 _HTTP_LOCAL = threading.local()
 _INFERENCE_LOCK = threading.Lock()
@@ -64,6 +65,12 @@ def arg_parser():
                    help='Import only first N unique valid URLs; 0 = entire file')
     p.add_argument('--retry-network', action='store_true',
                    help='Retry due DNS/timeout jobs from earlier runs')
+    p.add_argument('--auto-network-retry', action='store_true',
+                   help='Opt-in: dispatch due DNS/timeout retries while running')
+    p.add_argument('--auto-retry-every', type=int, default=5,
+                   help='One retry after N-1 normal jobs, if due')
+    p.add_argument('--auto-retry-max-per-minute', type=int, default=10,
+                   help='Rolling 60 second cap on automatic retries')
     p.add_argument('--network-retry-minutes', type=int, default=30,
                    help='Retry delay (minutes) for transient DNS / HTTP timeouts')
     p.add_argument('--dns-no-address-retry-minutes', type=int, default=360,
@@ -135,6 +142,12 @@ def validate_options(args):
         raise ValueError('dns-not-found-retry-minutes must be >= 0')
     if args.max_network_attempts < 1:
         raise ValueError('max-network-attempts must be >= 1')
+    if getattr(args, 'auto_retry_every', 5) < 2:
+        raise ValueError('auto-retry-every must be >= 2')
+    if getattr(args, 'auto_retry_max_per_minute', 10) < 1:
+        raise ValueError('auto-retry-max-per-minute must be >= 1')
+    if getattr(args, 'auto_network_retry', False) and args.retry_network:
+        raise ValueError('Use --auto-network-retry OR --retry-network, not both')
     if args.http_max_bytes < 1024:
         raise ValueError('http-max-bytes must be >= 1024')
     if args.min_host_interval < 0:
@@ -949,6 +962,8 @@ def run(args):
     interactive = getattr(args, 'telegram_checks', False)
     if interactive and (args.limit or args.http_only):
         raise ValueError('--telegram-checks requires --limit 0 and browser support')
+    if getattr(args, 'auto_network_retry', False) and not interactive:
+        raise ValueError('--auto-network-retry requires --telegram-checks --limit 0')
     engine = load_engine(args.engine_file, args)
     conn = connect_db(args.db)
     started = time.monotonic()
@@ -990,6 +1005,12 @@ def run(args):
             browser_thread.start()
         processed, waiting_browser, last_id, logged = 0, 0, 0, 0
         futures = {}
+        retry_pacer = (RetryPacer(getattr(args, 'auto_retry_every', 5),
+                                  getattr(args, 'auto_retry_max_per_minute', 10))
+                       if getattr(args, 'auto_network_retry', False) else None)
+        if retry_pacer is not None:
+            log(f'Auto network retry enabled: every={retry_pacer.every}, '
+                f'max_per_minute={retry_pacer.max_per_minute}')
         limit = args.limit or float('inf')
 
         def handle_browser_result(result):
@@ -1035,14 +1056,20 @@ def run(args):
                 # Leave capacity for interactive work when Selenium is backlogged.
                 if interactive and priority is None and waiting_browser + len(futures) >= args.browser_queue_size:
                     return False
-                row = priority or find_next_pending_job(conn, last_id, wrap=interactive)
+                now_mono = time.monotonic()
+                row, kind = choose_next_job(
+                    conn, last_id, interactive=interactive, priority=priority,
+                    pacer=retry_pacer, now_utc=utcnow(), now_monotonic=now_mono,
+                    max_attempts=args.max_network_attempts)
                 if row is None:
                     return False
                 id_, url = row
-                if priority is None:
+                if kind == 'routine':
                     last_id = id_
                 conn.execute("UPDATE jobs SET status='http_inflight', attempts=attempts+1, "
                              "updated_at=? WHERE id=?", (utcnow(), id_))
+                if retry_pacer is not None:
+                    retry_pacer.record(kind, now_mono)
             futures[pool.submit(fetch_http, engine, url, args)] = (id_, url)
             return True
 
@@ -1139,6 +1166,8 @@ def run(args):
                         log(f'HTTP attempted={processed}, browser_queued={browser_queued_count}, '
                             f'http_retry_pending={deferred_count}, browser_inflight={waiting_browser}, '
                             f'elapsed={time.monotonic()-started:.0f}s')
+                        if retry_pacer is not None:
+                            log(f'auto_retry_dispatched={retry_pacer.retries_dispatched}')
                         logged = processed
         if browser_thread is not None:
             while waiting_browser:
