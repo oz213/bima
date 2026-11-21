@@ -1,0 +1,12 @@
+[Unit]
+Description=Train BIMA text candidate from verified reviews
+
+[Service]
+Type=oneshot
+User=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONPATH=multi
+Environment=BIMA_LEARNING_SOURCE=multi/state/crawler_production.sqlite3
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B -m learning.cli learn --production-db ${BIMA_LEARNING_SOURCE}
+UMask=0077
+Nice=10

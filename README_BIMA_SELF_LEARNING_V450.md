@@ -149,3 +149,50 @@ for small samples.
   canary deployment, approval gates, and rollback.
 - Never alter thresholds, blacklist, whitelist, or alert actions by autonomous
   learning from BIMA's own unverified alerts.
+
+## Siklus belajar otomatis v4.5.1
+
+Dari root repo, jalankan dengan akun service:
+
+```sh
+PYTHONPATH=multi ./venv/bin/python3 -B -m learning.cli learn --production-db multi/state/crawler_production.sqlite3
+```
+
+Gunakan path database produksi yang dipakai crawler saat ini. Perintah mengambil kandidat
+review terbaru (maksimum 5.000 alert), kemudian membaca label teks final dari database
+learning. Analis memakai alur attach-text dan review di atas. Gunakan domain terdaftar
+yang sama sebagai domain-group untuk subdomain terkait.
+
+Status waiting_for_labels berarti jumlah label atau cakupan kelas belum cukup.
+Syarat awal mengikuti ekspor v4.5.0: 100 kasus, 25 per kelas, 20 kelompok domain,
+serta kedua kelas terwakili di setiap split. Kode melatih kandidat multinomial
+Naive Bayes dengan token kata yang di-hash pada bagian train. Hasil validation
+dan test memuat confusion matrix, precision, recall dan F1 untuk kelas gambling.
+Skor ini mengukur sampel review yang terpilih; evaluasi pada domain representatif
+diperlukan untuk mengukur performa operasional.
+
+candidate_ready memuat lokasi model.json dan report.json di multi/state/learning-runs/.
+Dataset identik menghasilkan up_to_date. Dataset yang berubah menghasilkan direktori
+kandidat baru. File model dapat dibaca sebagai JSON dan dipakai secara offline dengan
+learning.candidate.predict(model, text). Crawler produksi tetap menjalankan IndoBERT.
+
+Untuk menjalankan siklus harian pada server setelah tes sukses:
+
+```sh
+sudo install -m 0644 deploy/pandi-learning.service deploy/pandi-learning.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Jika database crawler berada di NFS atau path nondefault, jalankan
+`sudo systemctl edit pandi-learning.service` dan isi bagian [Service] dengan
+`Environment=BIMA_LEARNING_SOURCE=/path/aktual/crawler_production.sqlite3`.
+Database learning dan model kandidat menggunakan direktori state lokal secara default.
+Pastikan direktori state untuk learning berada pada filesystem lokal bila state crawler
+merupakan symlink ke NFS. Opsi CLI --learning-db (sebelum learn) dan --runs (setelah learn)
+dapat diarahkan ke penyimpanan lokal dengan override ExecStart.
+
+```sh
+sudo systemctl start pandi-learning.service &&
+sudo systemctl enable --now pandi-learning.timer
+sudo journalctl -u pandi-learning.service -n 30 --no-pager
+```

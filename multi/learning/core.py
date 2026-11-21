@@ -354,6 +354,10 @@ def review_stats(learning_db):
             "kinds": kinds, "evidence_attached": evidence}
 
 
+class InsufficientExamples(ValueError):
+    """The verified corpus is not yet large or diverse enough."""
+
+
 def export_dataset(learning_db, output_dir, seed="bima-v450", min_total=100,
                    min_per_class=25, min_groups=20):
     """Export verified text only; stable domain-group split; no model training."""
@@ -376,14 +380,14 @@ def export_dataset(learning_db, output_dir, seed="bima-v450", min_total=100,
             "ORDER BY c.id"
         ).fetchall()
     if len(rows) < min_total:
-        raise ValueError("Not enough human-verified text cases: %d < %d" % (len(rows), min_total))
+        raise InsufficientExamples("Not enough human-verified text cases: %d < %d" % (len(rows), min_total))
 
     counts = Counter(r[3] for r in rows)
     if any(counts.get(label, 0) < min_per_class for label in ("gambling", "non_gambling")):
-        raise ValueError("Insufficient verified examples per class: %s" % dict(counts))
+        raise InsufficientExamples("Insufficient verified examples per class: %s" % dict(counts))
     groups = {r[2] for r in rows}
     if len(groups) < min_groups:
-        raise ValueError("Insufficient distinct domain groups: %d < %d" % (len(groups), min_groups))
+        raise InsufficientExamples("Insufficient distinct domain groups: %d < %d" % (len(groups), min_groups))
 
     # Duplicate text across opposing classes would contaminate the labels.
     seen_texts = {}
@@ -409,7 +413,7 @@ def export_dataset(learning_db, output_dir, seed="bima-v450", min_total=100,
         groups_by_split[part].add(group)
 
     if any(not files[part] for part in files):
-        raise ValueError("One or more splits are empty; gather more verified domain groups")
+        raise InsufficientExamples("One or more splits are empty; gather more verified domain groups")
     assert sum(len(v) for v in files.values()) == len(rows)
     assert len(set.union(*groups_by_split.values())) == sum(len(v) for v in groups_by_split.values())
 

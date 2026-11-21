@@ -18,7 +18,7 @@ from .core import (
 def make_parser():
     parser = argparse.ArgumentParser(
         prog="python3 -m learning.cli",
-        description="BIMA v4.5.0 human-supervised learning (no crawling, BIMA API, or training)",
+        description="BIMA offline review and candidate learning",
     )
     parser.add_argument(
         "--learning-db", default="multi/state/bima_learning_v450.sqlite3",
@@ -61,6 +61,9 @@ def make_parser():
     export.add_argument("--min-total", type=int, default=100)
     export.add_argument("--min-per-class", type=int, default=25)
     export.add_argument("--min-groups", type=int, default=20)
+    learn = sub.add_parser("learn", help="Fit and evaluate a candidate from verified labels")
+    learn.add_argument("--production-db", help="Optionally seed review cases read-only before learning")
+    learn.add_argument("--runs", type=Path, default=Path("multi/state/learning-runs"))
     return parser
 
 
@@ -83,6 +86,14 @@ def main(argv=None):
                 args.learning_db, args.case, args.label,
                 args.reviewer, args.note, args.domain_group, args.text_label,
             )
+        elif args.command == "learn":
+            from .candidate import learn
+            seeded = None
+            if args.production_db:
+                seeded = seed_review_queue(args.production_db, args.learning_db)
+            result = learn(args.learning_db, args.runs)
+            if seeded is not None:
+                result["seed"] = seeded
         elif args.command == "stats":
             result = review_stats(args.learning_db)
         else:
