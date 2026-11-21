@@ -378,6 +378,27 @@ def classify_shared(engine, url, current_url, text, title, source='requests', pa
     return result
 
 
+_legacy_classify_shared = classify_shared
+
+
+def classify_shared(engine, url, current_url, text, title, source='requests', page_html=None):
+    """Preserve the existing IndoBERT/gambling decision; append opt-in shadow metadata."""
+    result = _legacy_classify_shared(engine, url, current_url, text, title,
+                                     source=source, page_html=page_html)
+    if os.environ.get('BIMA_PHISHING_SHADOW') != '1':
+        return result
+    try:
+        from phishing_signals import enrich_classification
+        return enrich_classification(result, initial_url=url,
+                                     current_url=current_url, page_html=page_html)
+    except Exception:
+        # A telemetry-only detector may never cause a crawler failure or new alert.
+        safe = dict(result)
+        safe['phishing_triage'] = {
+            'version': 'phishing_shadow_v1', 'status': 'scanner_error', 'signal_codes': []}
+        return safe
+
+
 def browser_sampling_selected(url, rate):
     fraction = int.from_bytes(hashlib.sha256(url.encode()).digest()[:8], 'big') / (1 << 64)
     return fraction < rate
