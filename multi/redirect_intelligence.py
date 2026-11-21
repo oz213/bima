@@ -368,7 +368,10 @@ def build_redirect_chains(observations, *, limit: int = 10, max_hops: int = 4) -
             consumed.add(key(current))
             hops.append({'method': 'http', 'http_status': current.http_status,
                          'destination': current.destination_url,
-                         'external': current.external})
+                         'external': current.external,
+                         'redirect_scope': current.redirect_scope,
+                         'outside_id': current.outside_id,
+                         'evidence_level': 'http_observed'})
             if current.external or current.destination_url in seen_urls:
                 break
             seen_urls.add(current.destination_url)
@@ -376,6 +379,7 @@ def build_redirect_chains(observations, *, limit: int = 10, max_hops: int = 4) -
             current = next((x for x in next_edges if key(x) not in consumed), None)
         if hops:
             result.append({'seed': edge.seed_hostname, 'confidence': 'http_observed',
+                           'evidence_level': 'http_observed',
                            'source': edge.source_url, 'hops': hops})
 
     for edge in http_edges:
@@ -389,6 +393,9 @@ def build_redirect_chains(observations, *, limit: int = 10, max_hops: int = 4) -
             break
         if edge.method != 'http':
             result.append({'seed': edge.seed_hostname, 'confidence': 'static_signal',
+                           'evidence_level': 'static_signal',
                            'method': edge.method, 'source': edge.source_url,
-                           'destination': edge.destination_url, 'external': edge.external})
+                           'destination': edge.destination_url, 'external': edge.external,
+                           'redirect_scope': edge.redirect_scope,
+                           'outside_id': edge.outside_id})
     return result

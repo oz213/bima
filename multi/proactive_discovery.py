@@ -233,6 +233,31 @@ class RedirectObservation:
     http_status: int
     external: bool
 
+    @property
+    def redirect_scope(self) -> str:
+        """Host-level scope. cross_id_host is NOT proof of separate registrants.
+
+        Legacy ``external`` means outside the original seed, not outside .id.
+        Preserve that flag for stored evidence and downstream compatibility.
+        """
+        source_host = host_of(self.source_url)
+        target_host = host_of(self.destination_url)
+        if target_host == source_host:
+            return 'same_host'
+        if within_seed(self.destination_url, self.seed_hostname):
+            return 'within_seed_subdomain'
+        if target_host.endswith('.id') and target_host != 'id':
+            return 'cross_id_host'
+        return 'outside_id'
+
+    @property
+    def outside_id(self) -> bool:
+        return self.redirect_scope == 'outside_id'
+
+    @property
+    def evidence_level(self) -> str:
+        return 'http_observed' if self.method == 'http' else 'static_signal'
+
 
 def evidence_destination(value: str, *, base_url: str) -> str | None:
     """Normalize a redirect location for passive *recording*, never fetching.
@@ -648,7 +673,9 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
                 'robots_reasons': {}, 'http_response_codes': {},
                 'redirect_stop_reasons': {}, 'js_static_redirects': 0,
-                'js_dynamic_pages': 0, 'browser_review_candidates': []}
+                'js_dynamic_pages': 0, 'browser_review_candidates': [],
+                'redirect_scope_counts': {}, 'redirect_evidence_counts': {},
+                'outside_id_redirects': 0}
     review_by_key: dict[tuple[str, str, str], dict] = {}
     last_robots_reason = 'not_checked'
     homepage_status = 'not_checked'
@@ -657,7 +684,8 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         group = counters[key]
         group[value] = group.get(value, 0) + 1
 
-    def add_review(source: str, reason: str, score: int, destination: str = ''):
+    def add_review(source: str, reason: str, score: int, destination: str = '',
+                   observation: RedirectObservation | None = None):
         if browser_review_limit <= 0:
             return
         # Only redacted .id source URLs and redacted evidence destinations.
@@ -665,8 +693,13 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         if safe_source is None:
             return
         key = (safe_source, reason, destination)
-        review_by_key[key] = {'source': safe_source, 'reason': reason,
-                              'priority': score, 'destination': destination or None}
+        review_by_key[key] = {
+            'source': safe_source, 'reason': reason,
+            'priority': score, 'destination': destination or None,
+            'redirect_scope': observation.redirect_scope if observation else None,
+            'outside_id': observation.outside_id if observation else None,
+            'evidence_level': observation.evidence_level if observation else 'dynamic_hint',
+        }
 
     def observe(result: FetchResult):
         if result.status:
@@ -681,20 +714,36 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         for item in result.redirects:
             counters['redirect_observations'] += 1
             counters['external_redirects'] += int(item.external)
+            counters['outside_id_redirects'] += int(item.outside_id)
+            tally('redirect_scope_counts', item.redirect_scope)
+            tally('redirect_evidence_counts', item.evidence_level)
             if item.method.startswith('js_'):
                 counters['js_static_redirects'] += 1
             # robots.txt redirects are access-control events, not a browser
             # verification priority signal for the website's actual content.
             if item.external and not urlsplit(item.source_url).path.endswith('/robots.txt'):
-                if item.method == 'http':
-                    add_review(item.source_url, 'external_http_redirect', 95,
-                               item.destination_url)
-                elif item.method == 'meta_refresh':
-                    add_review(item.source_url, 'external_meta_refresh', 85,
-                               item.destination_url)
-                elif item.method.startswith('js_'):
-                    add_review(item.source_url, 'external_js_static', 75,
-                               item.destination_url)
+                # Preserve v4.3 reason/score for truly outside-.id redirects.
+                # A second .id hostname is NOT scored like an off-namespace hop.
+                if item.outside_id:
+                    if item.method == 'http':
+                        add_review(item.source_url, 'external_http_redirect', 95,
+                                   item.destination_url, item)
+                    elif item.method == 'meta_refresh':
+                        add_review(item.source_url, 'external_meta_refresh', 85,
+                                   item.destination_url, item)
+                    elif item.method.startswith('js_'):
+                        add_review(item.source_url, 'external_js_static', 75,
+                                   item.destination_url, item)
+                else:
+                    if item.method == 'http':
+                        add_review(item.source_url, 'cross_id_host_http_redirect', 55,
+                                   item.destination_url, item)
+                    elif item.method == 'meta_refresh':
+                        add_review(item.source_url, 'cross_id_host_meta_refresh', 45,
+                                   item.destination_url, item)
+                    elif item.method.startswith('js_'):
+                        add_review(item.source_url, 'cross_id_host_js_static', 35,
+                                   item.destination_url, item)
             if redirect_observer is not None:
                 redirect_observer(item)
 
@@ -1090,11 +1139,13 @@ def run(args) -> dict:
                  'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
                  'robots_reasons': {}, 'http_response_codes': {},
                  'redirect_stop_reasons': {}, 'js_static_redirects': 0,
-                 'js_dynamic_pages': 0}
+                 'js_dynamic_pages': 0, 'redirect_scope_counts': {},
+                 'redirect_evidence_counts': {}, 'outside_id_redirects': 0}
         review_candidates: list[dict] = []
         seed_diagnostics: list[dict] = []
         dns_audit_results: list[dict] = []
         dns_status_counts: dict[str, int] = {}
+        dns_confidence_counts: dict[str, int] = {}
         redirects_by_key: dict[tuple[str, str, str], RedirectObservation] = {}
         def observe_redirect(item: RedirectObservation):
             redirects_by_key[(item.source_url, item.destination_url, item.method)] = item
@@ -1132,11 +1183,15 @@ def run(args) -> dict:
                     audit = audit_dns_failure(seed, timeout=getattr(args, 'dns_audit_timeout', 1.5))
                     dns_audit_results.append(audit)
                     dns_status = audit['dns_status']
+                    dns_confidence = audit.get('dns_confidence', 'inconclusive')
                 else:
                     dns_status = 'dns_resolution_failed_unverified'
+                    dns_confidence = 'inconclusive'
                 dns_status_counts[dns_status] = dns_status_counts.get(dns_status, 0) + 1
+                dns_confidence_counts[dns_confidence] = dns_confidence_counts.get(dns_confidence, 0) + 1
                 if dns_audit_limit:
                     diagnostic['dns_status'] = dns_status
+                    diagnostic['dns_confidence'] = dns_confidence
             if len(seed_diagnostics) < getattr(args, 'diagnostic_seeds', 0):
                 seed_diagnostics.append(diagnostic)
             for k, v in counters.items():
@@ -1146,7 +1201,8 @@ def run(args) -> dict:
                     review_candidates.extend(v)
                     continue
                 if k in ('fetch_failure_types', 'robots_reasons',
-                         'http_response_codes', 'redirect_stop_reasons'):
+                         'http_response_codes', 'redirect_stop_reasons',
+                         'redirect_scope_counts', 'redirect_evidence_counts'):
                     for category, count in v.items():
                         totals = stats[k]
                         totals[category] = totals.get(category, 0) + count
@@ -1188,6 +1244,7 @@ def run(args) -> dict:
             'dns_failed_seeds': sum(dns_status_counts.values()),
             'dns_audits_performed': len(dns_audit_results),
             'dns_status_counts': dns_status_counts,
+            'dns_confidence_counts': dns_confidence_counts,
             'preview_dns_audits': dns_audit_results if not args.apply else [],
             'preview_diagnostics': seed_diagnostics if not args.apply else [],
             'preview_browser_review': sorted(
@@ -1202,7 +1259,9 @@ def run(args) -> dict:
             'preview_redirects': [
                 {'source': item.source_url, 'destination': item.destination_url,
                  'method': item.method, 'http_status': item.http_status,
-                 'external': item.external}
+                 'external': item.external, 'redirect_scope': item.redirect_scope,
+                 'outside_id': item.outside_id,
+                 'evidence_level': item.evidence_level}
                 for item in redirect_events[:min(10, args.preview_samples)]
             ],
             'preview_candidates': [

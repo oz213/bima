@@ -64,11 +64,40 @@ def summarize_dns_audit(hostname: str, audit: dict[str, Any]) -> dict[str, Any]:
             status = 'dns_authority_responding_address_unknown'
     elif raw_diagnosis == 'delegation_loop':
         status = 'dns_delegation_loop'
-    # Other diagnoses (including bootstrap failure, incomplete coverage,
-    # network timeout, SERVFAIL and mixed rcodes) remain inconclusive.
+    # Confidence describes the *scope of evidence*, never registry status,
+    # DNSSEC validity, web reachability, or abuse. Parent NXDOMAIN observations
+    # remain partial if some parent servers do not answer. A direct A/AAAA
+    # observation is partial even with full NS coverage: CNAME is not followed.
+    confidence = 'inconclusive'
+    reasons = []
+    if status == 'dns_lame_delegation':
+        confidence = 'confirmed'
+    elif status == 'dns_lame_delegation_suspected':
+        confidence = 'suspected'
+        reasons.append('authority_coverage_incomplete')
+    elif status == 'dns_nxdomain_authoritative':
+        confidence = 'partial'
+        reasons.append('parent_nxdomain_observation')
+    elif status in ('dns_authoritative_address_observed',
+                    'dns_no_direct_address_observed',
+                    'dns_host_nxdomain_observed',
+                    'dns_authority_responding_address_unknown'):
+        confidence = 'partial'
+        reasons.append('direct_a_aaaa_observation_only')
+    elif status in ('dns_delegated_ns_unresolvable',
+                    'dns_authority_unreachable', 'dns_delegation_loop'):
+        confidence = 'partial'
+    if not coverage and status not in ('dns_lame_delegation_suspected',
+                                        'dns_lame_delegation'):
+        reasons.append('authority_coverage_incomplete')
+    if confidence == 'inconclusive':
+        reasons.append('insufficient_authoritative_evidence')
+    # All reason strings are from a fixed safe vocabulary, not raw DNS output.
     return {
         'seed': hostname,
         'dns_status': status,
+        'dns_confidence': confidence,
+        'dns_uncertainty_reasons': reasons,
         'delegated_zone': zone,
         'authority_rcodes': rcodes,
         'authority_checks': len(checks),
@@ -98,6 +127,8 @@ def audit_dns_failure(hostname: str, *, timeout: float) -> dict[str, Any]:
         return {
             'seed': hostname,
             'dns_status': 'dns_audit_unavailable_or_error',
+            'dns_confidence': 'inconclusive',
+            'dns_uncertainty_reasons': ['audit_unavailable'],
             'delegated_zone': None,
             'authority_rcodes': [],
             'authority_checks': 0,
