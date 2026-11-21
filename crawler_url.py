@@ -12,6 +12,7 @@ import base64
 
 import joblib
 
+from html.parser import HTMLParser
 import requests
 
 import tempfile
@@ -5089,6 +5090,74 @@ def is_anti_gambling_rejection_context(page_text, page_title="", page_html=None,
     return True
 
 
+class BlocklistNavigationParser(HTMLParser):
+    """Collect destinations and the document base, including form overrides."""
+
+    def __init__(self):
+        super().__init__()
+        self.base = None
+        self.targets = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "base" and self.base is None and attrs.get("href"):
+            self.base = attrs["href"]
+        for element, attribute in (("a", "href"), ("form", "action"),
+                                   ("button", "formaction"), ("input", "formaction")):
+            if tag == element and attrs.get(attribute):
+                self.targets.append(attrs[attribute])
+
+
+def is_blocklist_reporting_context(page_text, page_title, page_html, current_url):
+    """Account for each keyword mention before downgrading a contextual alert."""
+    if not page_text or len(page_text) > 50000:
+        return False
+    text = re.sub(r"\s+", " ", page_text.casefold())
+    if not (re.search(r"\bcek domain\b", text)
+            and re.search(r"\blapor(?:kan)? situs\b", text)
+            and re.search(r"\bdaftar blokir\b", text)):
+        return False
+
+    # Remove only the blocked example entry, nearby category labels, and
+    # explicit filtering/reporting language. Scan the entire remainder.
+    example = (r"\b(?:[a-z0-9-]+\.)+[a-z]{2,24}\s*di(?:blokir|block)"
+               r"(?:\s*[·:|–-]?\s*(?:judi online|judol)\b)?")
+    text, entries = re.subn(example, " ", text)
+    if not entries:
+        return False
+    category = r"(?:judi online|judol)"
+    other = r"(?:porno(?:grafi)?|malware|spyware|iklan|phishing)"
+    separator = r"(?:\s*,\s*|\s+dan\s+)"
+    listing = rf"(?:{other}{separator}){{0,5}}{category}\b"
+    text = re.sub(rf"\b(?:blokir|memblokir|menyaring|laporkan|lapor)\s+situs\s+{listing}", " ", text)
+    text = re.sub(rf"\b(?:ketemu|menemukan) situs {category}(?=[^.!?]{{0,65}}\?\s*laporkan)", " ", text)
+    text = re.sub(rf"\b\d[\d.,]*\s+{category}(?=\s+\d[\d.,]*\s+{other})", " ", text)
+    if find_keyword_hits(f"{page_title or ''} {text}", STRONG_TEXT_KEYWORDS):
+        return False
+
+    # A report UI can itself be compromised. Inspect hidden evidence and
+    # navigable links, including the actual destination of a registration CTA.
+    try:
+        html = page_html() if callable(page_html) else page_html
+        if not html or has_hidden_gambling_links(html, page_url=current_url)[0]:
+            return False
+        host = urlparse(current_url).hostname
+        if not host:
+            return False
+        parser = BlocklistNavigationParser()
+        parser.feed(html)
+        parser.close()
+        base_url = urljoin(current_url, parser.base or "")
+        for ref in parser.targets:
+            target = urlparse(urljoin(base_url, ref))
+            if (target.scheme not in ("http", "https") or target.hostname != host
+                    or find_keyword_hits(unquote(target.path + " " + target.query), STRONG_TEXT_KEYWORDS)):
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def classify_risk(page_text, ml_hit, ml_conf, ml_pred=None, captcha_hit=False, ml_source="classic_ml", page_title="", page_html=None, current_url=""):
 
     text_hits = find_keyword_hits(page_text, STRONG_TEXT_KEYWORDS)
@@ -5509,6 +5578,11 @@ def classify_text_content(source, url, page_text, page_title, current_url, page_
     )
 
 
+
+    if (status == "medium_risk" and reason == "contextual_gambling_phrase_detected"
+            and classic_ml_pred == "non-gambling" and bert_pred == "non-gambling"
+            and is_blocklist_reporting_context(page_text, page_title, page_html, current_url)):
+        status, reason = "low_risk", "blocklist_reporting_context"
 
     log(
 
