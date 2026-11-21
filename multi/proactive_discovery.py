@@ -357,6 +357,8 @@ def fetch_failure_kind(result: FetchResult) -> str:
     if result.error in ('ConnectionRefusedError', 'ConnectionResetError',
                         'ConnectionAbortedError', 'BrokenPipeError', 'RemoteDisconnected'):
         return 'connection'
+    if result.error == 'redirect_origin_requires_robots':
+        return 'origin_policy_required'
     if result.error == 'redirect_out_of_scope':
         return 'external_redirect'
     if result.error in ('out_of_scope', 'redirect_invalid', 'ValueError',
@@ -458,7 +460,15 @@ class SafeFetcher:
                     # External landing pages are NOT fetched by discovery.
                     if item.external:
                         return FetchResult(status, normalize_url(current) or current, '', 'redirect_out_of_scope', tuple(observed))
-                    # Follow internal redirects only, maintaining the IP pinning
+                    # A redirect from apex to www (or HTTPS to HTTP) crosses an
+                    # origin boundary. Never fetch that new origin before its
+                    # own robots.txt has been checked by the caller.
+                    origin = urlsplit(current)
+                    target = urlsplit(item.destination_url)
+                    if (origin.scheme, origin.hostname) != (target.scheme, target.hostname):
+                        return FetchResult(status, normalize_url(current) or current, '',
+                                           'redirect_origin_requires_robots', tuple(observed))
+                    # Follow internal same-origin redirects, maintaining IP pinning
                     # and public-IP checks at every single network connection.
                     # Keep an in-scope redirect's query during the HTTP request;
                     # do not record it in redirect evidence or output.
@@ -532,18 +542,39 @@ def ct_subdomains(seed: str, *, timeout: float = 8, max_bytes: int = 400_000) ->
     return sorted(names)
 
 
+def canonical_www_origin(result: FetchResult, *, origin: str,
+                         source_path: str, seed: str) -> str | None:
+    """Allow only exact apex -> www apex redirects with the same scheme/path.
+
+    The new origin is NOT authorized by the old robots file; the caller must
+    GET www.<seed>/robots.txt independently before visiting any www page.
+    """
+    if (result.error != 'redirect_origin_requires_robots' or
+            not result.redirects or seed.startswith('www.')):
+        return None
+    hop = result.redirects[-1]
+    src, dest, requested = (urlsplit(hop.source_url),
+                            urlsplit(hop.destination_url), urlsplit(origin))
+    if (hop.method != 'http' or hop.external or
+            src.scheme != requested.scheme or src.hostname != seed or
+            src.path != source_path or dest.scheme != requested.scheme or
+            dest.hostname != 'www.' + seed or dest.path != source_path):
+        return None
+    return f'{dest.scheme}://{dest.hostname}/'
+
+
 def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                   include_ct: bool = False, ct_lookup: Callable[[str], list[str]] | None = None,
                   max_candidates: int = 30, max_sitemaps: int = 2,
                   probe_candidates: int = 0,
                   redirect_observer: Callable[[RedirectObservation], None] | None = None,
                   http_fallback: bool = False,
+                  canonical_www: bool = False,
                   ) -> tuple[list[Candidate], dict]:
-    """Discover public URLs without browser execution or BIMA alerts.
+    """Conservative discovery; never trust apex robots for a www origin.
 
-    With explicit http_fallback=True, try HTTP only after certain HTTPS
-    transport failures. Always check HTTP robots separately, never use an
-    HTTPS robots policy as permission to crawl a different origin.
+    Canonical www handling is opt-in and bounded to one verified host switch.
+    The fetcher stops at cross-origin redirects before fetching the new host.
     """
     found: dict[str, Candidate] = {}
     robots_policy = None
@@ -553,9 +584,24 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 'redirect_observations': 0, 'external_redirects': 0,
                 'probed_pages': 0, 'probe_errors': 0,
                 'http_fallback_attempts': 0, 'http_fallback_success': 0,
-                'http_fallback_blocked': 0, 'fetch_failure_types': {}}
+                'http_fallback_blocked': 0, 'fetch_failure_types': {},
+                'canonical_www_attempts': 0, 'canonical_www_verified': 0,
+                'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
+                'robots_reasons': {}, 'http_response_codes': {},
+                'redirect_stop_reasons': {}}
+    last_robots_reason = 'not_checked'
+    homepage_status = 'not_checked'
+
+    def tally(key: str, value: str):
+        group = counters[key]
+        group[value] = group.get(value, 0) + 1
 
     def observe(result: FetchResult):
+        if result.status:
+            tally('http_response_codes', str(result.status))
+        if result.error in ('redirect_origin_requires_robots', 'redirect_out_of_scope',
+                            'redirect_limit', 'redirect_invalid'):
+            tally('redirect_stop_reasons', result.error)
         for item in result.redirects:
             counters['redirect_observations'] += 1
             counters['external_redirects'] += int(item.external)
@@ -563,14 +609,14 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 redirect_observer(item)
 
     def note_failure(result: FetchResult):
-        kind = fetch_failure_kind(result)
-        failures = counters['fetch_failure_types']
-        failures[kind] = failures.get(kind, 0) + 1
+        tally('fetch_failure_types', fetch_failure_kind(result))
 
     def add(value: str, source: str):
         item = make_candidate(value, seed=seed, source=source)
         if item is not None:
-            if (robots_policy is not None and host_of(item.url) == seed and
+            # Only the *selected* origin has been robots-verified; other
+            # subdomains may be retained as candidates but are never probed.
+            if (robots_policy is not None and host_of(item.url) == host_of(root_url) and
                     urlsplit(item.url).scheme == urlsplit(root_url).scheme):
                 if not robots_policy.can_fetch(USER_AGENT, item.url):
                     return
@@ -579,64 +625,124 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 found[item.url] = item
 
     def get_robots(origin: str):
-        """Return (permission, policy, sitemaps, response, effective_origin)."""
+        """Fetch robots for this exact origin, not for a redirected host."""
+        nonlocal last_robots_reason
         response = fetch(origin + 'robots.txt')
         counters['web_requests'] += 1
         observe(response)
-        # robots.txt with unreadable/oversize/non-text HTTP 200 is NOT an
-        # affirmative allow, even if the status code says 200.
-        usable = (response.status == 404 and response.error in ('', 'http_status')) or (
-            response.status == 200 and not response.error)
-        if not usable:
+        category = fetch_failure_kind(response)
+        if response.error == 'redirect_origin_requires_robots':
+            reason = 'robots_origin_redirect'
+        elif response.error == 'redirect_out_of_scope':
+            reason = 'robots_external_redirect'
+        elif category in ('dns', 'timeout', 'tls', 'connection'):
+            reason = 'robots_' + category
+        elif response.status in (401, 403):
+            reason = 'robots_access_denied'
+        elif response.status in (429, 503):
+            reason = 'robots_rate_limited'
+        elif response.error in ('oversize', 'non_text'):
+            reason = 'robots_invalid_content'
+        elif not ((response.status == 404 and response.error in ('', 'http_status')) or
+                  (response.status == 200 and not response.error)):
+            reason = 'robots_http_error'
+        else:
+            actual = urlsplit(response.final_url)
+            expected = urlsplit(origin)
+            if ((actual.scheme, actual.hostname) != (expected.scheme, expected.hostname) or
+                    actual.path != '/robots.txt'):
+                # In particular, a 200 response from /auth/signin is NOT a robots grant.
+                reason = 'robots_origin_or_path_mismatch'
+                tally('fetch_failure_types', 'unsafe_or_invalid')
+            elif response.status == 404:
+                reason = 'robots_not_found'
+                last_robots_reason = reason
+                tally('robots_reasons', reason)
+                return True, None, [], response, origin
+            else:
+                policy = robotparser.RobotFileParser()
+                policy.parse(response.text.splitlines())
+                sitemaps = []
+                for line in response.text.splitlines():
+                    if line.lower().lstrip().startswith('sitemap:'):
+                        sitemaps.append(line.partition(':')[2].strip())
+                allowed_origin = policy.can_fetch(USER_AGENT, origin)
+                reason = 'robots_allowed' if allowed_origin else 'robots_disallow'
+                last_robots_reason = reason
+                tally('robots_reasons', reason)
+                return allowed_origin, policy, sitemaps, response, origin
+        last_robots_reason = reason
+        tally('robots_reasons', reason)
+        if reason != 'robots_origin_or_path_mismatch' and reason != 'robots_disallow':
             note_failure(response)
-            return False, None, [], response, origin
-        # A same-seed *subdomain* robots file must not authorize seed pages.
-        # A same-host HTTPS->HTTP redirect gets its own effective origin.
-        if host_of(response.final_url) != seed:
-            counters['fetch_failure_types']['unsafe_or_invalid'] = (
-                counters['fetch_failure_types'].get('unsafe_or_invalid', 0) + 1)
-            return False, None, [], response, origin
-        effective_origin = urlsplit(response.final_url).scheme + '://' + seed + '/'
-        if response.status == 404:
-            return True, None, [], response, effective_origin
-        policy = robotparser.RobotFileParser()
-        policy.parse(response.text.splitlines())
-        sitemaps = []
-        for line in response.text.splitlines():
-            if line.lower().lstrip().startswith('sitemap:'):
-                sitemaps.append(line.partition(':')[2].strip())
-        return (policy.can_fetch(USER_AGENT, effective_origin), policy,
-                sitemaps, response, effective_origin)
+        return False, None, [], response, origin
+
+    def verify_canonical_www(response: FetchResult, *, previous_origin: str,
+                             path: str):
+        if not canonical_www or counters['canonical_www_attempts']:
+            return None
+        canonical = canonical_www_origin(response, origin=previous_origin,
+                                         source_path=path, seed=seed)
+        if canonical is None:
+            return None
+        counters['canonical_www_attempts'] += 1
+        checked = get_robots(canonical)
+        if checked[0]:
+            counters['canonical_www_verified'] += 1
+        else:
+            counters['canonical_www_blocked'] += 1
+        return checked
 
     if fetch is not None:
         allowed, robots_policy, sitemaps, robots, root_url = get_robots(root_url)
+        canonical = verify_canonical_www(robots, previous_origin=root_url,
+                                         path='/robots.txt')
+        if canonical is not None:
+            allowed, robots_policy, sitemaps, robots, root_url = canonical
         fallback_tried = False
-        if (not allowed and robots.status not in (200, 404)
-                and http_fallback and can_fallback_to_http(robots)):
+        if (not allowed and robots.status not in (200, 404) and
+                http_fallback and can_fallback_to_http(robots)):
             fallback_tried = True
             counters['http_fallback_attempts'] += 1
             root_url = 'http://' + seed + '/'
             allowed, robots_policy, sitemaps, robots, root_url = get_robots(root_url)
+            canonical = verify_canonical_www(robots, previous_origin=root_url,
+                                             path='/robots.txt')
+            if canonical is not None:
+                allowed, robots_policy, sitemaps, robots, root_url = canonical
             if not allowed:
                 counters['http_fallback_blocked'] += 1
-        if (not allowed and (robots.status not in (200, 404) or
-                             robots.error not in ('', 'http_status') or
-                             host_of(robots.final_url) != seed)):
+        if not allowed:
             counters['web_errors'] += 1
-        if allowed:
+        else:
+            homepage_origin = root_url
             homepage = fetch(root_url)
             counters['web_requests'] += 1
             observe(homepage)
             if homepage.status != 200 or homepage.error:
                 note_failure(homepage)
-            # An HTTPS robots 200/404 is NOT permission to scan HTTP. A
-            # failed HTTPS homepage needs a separate HTTP robots check.
-            if (http_fallback and not fallback_tried and root_url.startswith('https://')
-                    and can_fallback_to_http(homepage)):
+            canonical = verify_canonical_www(homepage, previous_origin=homepage_origin,
+                                             path='/')
+            if canonical is not None:
+                allowed, robots_policy, sitemaps, robots, root_url = canonical
+                if allowed:
+                    homepage = fetch(root_url)
+                    counters['web_requests'] += 1
+                    observe(homepage)
+                    if homepage.status != 200 or homepage.error:
+                        note_failure(homepage)
+            # An HTTPS robots grant is not a grant for HTTP. Check HTTP robots
+            # independently on *transport* failures, never HTTP 403 / redirect.
+            if (allowed and http_fallback and not fallback_tried and
+                    root_url.startswith('https://') and can_fallback_to_http(homepage)):
                 fallback_tried = True
                 counters['http_fallback_attempts'] += 1
                 http_root = 'http://' + seed + '/'
                 http_allowed, http_policy, http_maps, http_robots, http_root = get_robots(http_root)
+                canonical = verify_canonical_www(http_robots, previous_origin=http_root,
+                                                 path='/robots.txt')
+                if canonical is not None:
+                    http_allowed, http_policy, http_maps, http_robots, http_root = canonical
                 if http_allowed:
                     allowed = True
                     robots_policy, sitemaps, root_url = http_policy, http_maps, http_root
@@ -650,14 +756,26 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                     counters['http_fallback_blocked'] += 1
                     counters['web_errors'] += 1
             if allowed:
-                if homepage.status == 200 and not homepage.error:
+                # Mocked or future fetchers must not silently bypass origin policy.
+                same_origin = (urlsplit(homepage.final_url).scheme,
+                               host_of(homepage.final_url)) == (urlsplit(root_url).scheme,
+                                                               host_of(root_url))
+                if homepage.status == 200 and not homepage.error and same_origin:
+                    homepage_status = 'ok'
+                    if (counters['canonical_www_verified'] and
+                            host_of(root_url) == 'www.' + seed):
+                        counters['canonical_www_homepage_success'] += 1
                     parser = Links()
                     parser.feed(homepage.text)
                     for link in parser.links:
                         add(urljoin(homepage.final_url, link), 'homepage')
-                elif homepage.error != 'redirect_out_of_scope':
-                    counters['web_errors'] += 1
-                if fallback_tried and ((homepage.status == 200 and not homepage.error) or
+                else:
+                    homepage_status = 'origin_mismatch' if not same_origin else fetch_failure_kind(homepage)
+                    if homepage_status == 'origin_mismatch':
+                        tally('fetch_failure_types', 'unsafe_or_invalid')
+                    if homepage.error != 'redirect_out_of_scope':
+                        counters['web_errors'] += 1
+                if fallback_tried and ((homepage.status == 200 and not homepage.error and same_origin) or
                                        homepage.error == 'redirect_out_of_scope'):
                     counters['http_fallback_success'] += 1
                 if not sitemaps:
@@ -665,9 +783,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 visited_sitemaps = set()
                 while sitemaps and len(visited_sitemaps) < max_sitemaps:
                     sitemap = normalize_url(sitemaps.pop(0))
-                    # A sitemap on another scheme/host needs a distinct
-                    # robots check; do not fetch it under this origin's grant.
-                    if (not sitemap or host_of(sitemap) != seed or
+                    if (not sitemap or host_of(sitemap) != host_of(root_url) or
                             urlsplit(sitemap).scheme != urlsplit(root_url).scheme or
                             sitemap in visited_sitemaps):
                         continue
@@ -677,7 +793,8 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                     doc = fetch(sitemap)
                     counters['web_requests'] += 1
                     observe(doc)
-                    if doc.status != 200 or doc.error:
+                    if doc.status != 200 or doc.error or (urlsplit(doc.final_url).scheme,
+                           host_of(doc.final_url)) != (urlsplit(root_url).scheme, host_of(root_url)):
                         note_failure(doc)
                         counters['web_errors'] += 1
                         continue
@@ -692,12 +809,9 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         except (OSError, ValueError, TimeoutError, json.JSONDecodeError):
             counters['ct_errors'] += 1
     ordered = sorted(found.values(), key=lambda c: (-c.priority_score, c.url))[:max_candidates]
-    # Probe ONLY a bounded sample of discovered pages on the seed host
-    # and on the exact origin whose robots policy was checked above.
-    # Cross-host subdomains require their own robots policy before fetching.
     if fetch is not None and probe_candidates > 0 and allowed:
-        for item in (x for x in ordered if host_of(x.url) == seed
-                     and urlsplit(x.url).scheme == urlsplit(root_url).scheme):
+        for item in (x for x in ordered if host_of(x.url) == host_of(root_url) and
+                     urlsplit(x.url).scheme == urlsplit(root_url).scheme):
             if counters['probed_pages'] >= probe_candidates:
                 break
             if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, item.url):
@@ -710,15 +824,24 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 note_failure(result)
                 if result.error != 'redirect_out_of_scope':
                     counters['probe_errors'] += 1
-            # A redirect is a priority signal, not an abuse determination.
-            # Only evidence originating at the probed .id URL influences
-            # that URL's queue priority, not the external destination.
             if any(obs.external and obs.source_url == item.url and
                    obs.method in ('http', 'meta_refresh') for obs in result.redirects):
                 found[item.url] = Candidate(item.url, item.source,
                                             item.seed_hostname,
                                             min(100, item.priority_score + 30))
         ordered = sorted(found.values(), key=lambda c: (-c.priority_score, c.url))[:max_candidates]
+    counters['diagnostic'] = {
+        'seed': seed, 'selected_origin': root_url if allowed else None,
+        'robots_outcome': last_robots_reason, 'homepage_outcome': homepage_status,
+        'candidates': len(ordered),
+        'robots_reasons': dict(counters['robots_reasons']),
+        'http_response_codes': dict(counters['http_response_codes']),
+        'fetch_failure_types': dict(counters['fetch_failure_types']),
+        'redirect_stop_reasons': dict(counters['redirect_stop_reasons']),
+        'canonical_www_attempts': counters['canonical_www_attempts'],
+        'canonical_www_verified': counters['canonical_www_verified'],
+        'canonical_www_blocked': counters['canonical_www_blocked'],
+    }
     return ordered, counters
 
 
@@ -837,7 +960,12 @@ def run(args) -> dict:
                  'redirect_observations': 0, 'external_redirects': 0,
                  'probed_pages': 0, 'probe_errors': 0,
                  'http_fallback_attempts': 0, 'http_fallback_success': 0,
-                 'http_fallback_blocked': 0, 'fetch_failure_types': {}}
+                 'http_fallback_blocked': 0, 'fetch_failure_types': {},
+                 'canonical_www_attempts': 0, 'canonical_www_verified': 0,
+                 'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
+                 'robots_reasons': {}, 'http_response_codes': {},
+                 'redirect_stop_reasons': {}}
+        seed_diagnostics: list[dict] = []
         redirects_by_key: dict[tuple[str, str, str], RedirectObservation] = {}
         def observe_redirect(item: RedirectObservation):
             redirects_by_key[(item.source_url, item.destination_url, item.method)] = item
@@ -853,11 +981,17 @@ def run(args) -> dict:
                 max_sitemaps=args.max_sitemaps,
                 probe_candidates=args.probe_candidates,
                 redirect_observer=observe_redirect,
-                http_fallback=getattr(args, 'http_fallback', False))
+                http_fallback=getattr(args, 'http_fallback', False),
+                canonical_www=getattr(args, 'canonical_www', False))
+            if len(seed_diagnostics) < getattr(args, 'diagnostic_seeds', 0):
+                seed_diagnostics.append(counters['diagnostic'])
             for k, v in counters.items():
-                if k == 'fetch_failure_types':
+                if k == 'diagnostic':
+                    continue
+                if k in ('fetch_failure_types', 'robots_reasons',
+                         'http_response_codes', 'redirect_stop_reasons'):
                     for category, count in v.items():
-                        totals = stats['fetch_failure_types']
+                        totals = stats[k]
                         totals[category] = totals.get(category, 0) + count
                 else:
                     stats[k] += v
@@ -886,7 +1020,9 @@ def run(args) -> dict:
             'new_jobs': new, 'held_candidates': held,
             'pending_before': before, 'pending_after': after,
             'scan_web': args.scan_web, 'ct': args.ct,
-            'http_fallback': getattr(args, 'http_fallback', False), **stats,
+            'http_fallback': getattr(args, 'http_fallback', False),
+            'canonical_www': getattr(args, 'canonical_www', False), **stats,
+            'preview_diagnostics': seed_diagnostics if not args.apply else [],
             'unique_redirects': len(redirect_events),
             'preview_redirects': [
                 {'source': item.source_url, 'destination': item.destination_url,
@@ -911,6 +1047,10 @@ def arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--scan-web', action='store_true', help='Fetch public .id homepage/robots/sitemap')
     parser.add_argument('--http-fallback', action='store_true',
                         help='Opt-in: HTTPS transport failure -> HTTP only after separate robots check')
+    parser.add_argument('--canonical-www', action='store_true',
+                        help='Opt-in: independently check www.<seed>/robots.txt on apex redirect')
+    parser.add_argument('--diagnostic-seeds', type=int, default=0,
+                        help='Preview per-seed safe diagnostics for up to 100 seeds (0 disables)')
     parser.add_argument('--ct', action='store_true', help='Optional crt.sh public CT lookup (sends seed hostname)')
     parser.add_argument('--apply', action='store_true', help='ENQUEUE jobs into crawler DB; may trigger BIMA alerts')
     parser.add_argument('--seed-limit', type=int, default=20)
@@ -941,6 +1081,12 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('--probe-candidates requires --scan-web')
     if args.http_fallback and not args.scan_web:
         raise SystemExit('--http-fallback requires --scan-web')
+    if args.canonical_www and not args.scan_web:
+        raise SystemExit('--canonical-www requires --scan-web')
+    if not 0 <= args.diagnostic_seeds <= 100:
+        raise SystemExit('--diagnostic-seeds must be between 0 and 100')
+    if args.diagnostic_seeds and (not args.scan_web or args.apply):
+        raise SystemExit('--diagnostic-seeds requires --scan-web and preview (no --apply)')
     if args.timeout <= 0 or args.request_interval < 0 or args.preview_samples < 0 or args.min_host_interval < 0:
         raise SystemExit('timeout must be positive; interval/samples must be nonnegative')
     if args.start_index is not None and args.start_index < 0:
