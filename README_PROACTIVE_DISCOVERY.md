@@ -1,230 +1,177 @@
-# BIMA Proactive .ID Discovery — Patch v2 (Registry `urls.json`)
+# BIMA Proactive .ID Discovery & Redirect-Aware Re-Crawling — v4
 
-**Tujuan:** melengkapi crawler BIMA yang sudah ada dengan *URL discovery* dan *passive subdomain discovery*. **Belum dideploy** dan **belum diaktifkan** di server PANDI.
+**Status:** paket source untuk diterapkan di Mac dan dipush ke Git. **Belum terpasang atau diaktifkan di server.** Pengujian offline tidak menggantikan pengujian di staging dengan egress policy yang benar.
 
-Patch ini **menggantikan rancangan** `bima-discovery-v1.patch`. **Jangan apply kedua patch.**
+**Paket upgrade kompatibel v2 ke v4 (incremental):** Gunakan `bima-proactive-v2-to-v4-compatible.patch` bila repository sudah memiliki v2 di branch `main`. Jangan terapkan patch kumulatif v4/v3 atau upgrade lama bersamaan. Patch ini tidak melakukan text-hunk replace langsung terhadap `multi/crawler_multi.py`: jalankan `tools/upgrade_bima_queue.py` setelah patch agar perubahan antrean disesuaikan dengan struktur kode lokal dengan pemeriksaan AST dan validasi sintaks.
 
-## 1. Klarifikasi sumber data dan arsitektur
+## 1. Keputusan arsitektur
 
-- `urls.json` adalah daftar domain dari Registry PANDI yang **sudah memiliki NS**. File tersebut **diperbarui manual** oleh operator.
-- `multi/crawler_multi.py` telah menerima `urls.json` berupa `[...]` atau `{"urls": [...]}`; elemen array berupa URL/domain string. Modul v2 mendukung kedua format tersebut.
-- `urls.json` tetap menjadi *seed inventory*: hanya dibaca, **tidak diubah atau dibuat ulang**.
-- Tidak ada koneksi database langsung ke Registry, impor ekspor Registry kedua, atau sinkronisasi domain baru otomatis dalam patch ini.
-- Kandidat baru akan ditambahkan ke tabel `jobs` **hanya ketika** flag `--apply` digunakan. Proses crawler yang ada tetap bertanggung jawab atas klasifikasi IndoBERT, Selenium, dan pelaporan BIMA.
-- Dengan `--apply`, dua tabel dan satu indeks baru akan dibuat secara aditif pada SQLite crawler: `proactive_discovery_state` dan `proactive_discovery_candidates`. Tidak ada penghapusan atau reset job.
+- `urls.json` **sudah** memuat domain Registry PANDI yang memiliki nameserver (NS), dan **diperbarui manual**. File tersebut tetap menjadi baseline; patch ini **tidak mengubah file, tidak membuat sumber registry kedua**, dan tidak melakukan sinkronisasi Registry otomatis.
+- Seluruh penemuan/antrean baru ditujukan ke `.id`, termasuk IDN (punycode) dan subdomain di bawah baseline seed.
+- Crawler multi-worker dan model **IndoBERT** tetap melakukan klasifikasi. Discovery dan scheduler **tidak mengklasifikasikan konten sendiri** serta tidak pernah mengirim alert ke BIMA.
+- Redirect dari URL `.id` menuju `.com`/TLD lain dicatat sebagai bukti **tanpa menjadikan domain luar `.id` sebagai target baru**. Halaman tujuan eksternal **tidak diakses oleh Discovery Engine**.
+- **Penting:** `crawler_multi.py` utama sudah mengikuti beberapa redirect eksternal untuk klasifikasi. Pengamanan browser/egress/SSRF pada crawler utama harus diaudit di staging sebelum auto-enqueue atau recrawl produksi diaktifkan; kebijakan network/sandbox merupakan lapisan kontrol terpisah yang tidak ditambahkan oleh patch ini.
+- Informasi redirect **bukan vonis judi online**; JS literal tidak membuktikan browser benar-benar mengeksekusinya.
+
+### Diagram alur
 
 ```text
-urls.json (Registry delegated .id; update manual)
-          |
-          v
-multi/proactive_discovery.py (baru)
-  |- home page + tautan HTML (hanya di bawah seed .id)
-  |- robots.txt + sitemap (mematuhi larangan robots)
-  |- crt.sh public CT (opsional; perlu flag --ct)
-  |- filter IDN .id / URL bersih / dedup / skor prioritas
-          |
-          +--> PREVIEW (default; tanpa perubahan database)
-          |
-          +--> --apply --> BIMA SQLite jobs(pending) --> crawler_multi.py
-                                           (IndoBERT tetap)
+urls.json (Registry delegated .id; manual update)
+  ├─> proactive_discovery.py (homepage/robots/sitemap + optional CT)
+  │     ├─> optional small probe of discovered same-host pages
+  │     ├─> HTTP/Meta/JS redirect observations (destination redacted)
+  │     └─> default PREVIEW / optional --apply -> SQLite jobs(pending)
+  │
+  └─> recrawl_scheduler.py (SQLite metadata only; no network)
+        ├─> completed low_risk >7 days old, OR
+        ├─> new external-redirect signal after latest clean crawl, >24h old
+        └─> default PREVIEW / optional --apply --allow-live-rechecks
+             -> guarded status complete -> pending, audit logged
+                                       |
+                                       v
+                            crawler_multi.py
+                       HTTP + IndoBERT + browser
+                               BIMA / Telegram
 ```
 
-## 2. Apa yang sudah dan belum dikerjakan
-
-**Sudah (patch ini):**
-
-1. Seed otomatis dari data `urls.json`, dengan pembagian batch dan cursor SHA-256; ketika operator memperbarui `urls.json`, scan dimulai lagi dari seed pertama.
-2. Pencarian halaman HTML yang ditautkan dari homepage, `robots.txt`, dan XML sitemap sampai batas per domain. Tidak melakukan brute-force path, tidak menjalankan JavaScript, dan tidak memuat Selenium.
-3. CT lookup opsional via `crt.sh` untuk hostname subdomain yang cocok dengan seed. Lookup mengirim nama domain ke penyedia eksternal, sehingga **dimatikan secara default**.
-4. Validasi domain `.id`, IDN/punycode, hanya subdomain di bawah seed, tanpa query/fragment, port nonstandar maupun kredensial URL, dan menghindari path GET aksi seperti `logout`/`delete`.
-5. HTTP fetcher sendiri mengikuti redirect **hanya di bawah seed**; tidak memakai proxy environment, memverifikasi IP DNS global dan mengunci koneksi ke IP tervalidasi untuk mengurangi risiko DNS rebinding. Browser tidak dipakai.
-6. Batas ukuran respons, timeout, rate limit per-host, pembatasan sitemap, penyimpanan kandidat yang tertahan saat antrean penuh, dan idempotensi `INSERT OR IGNORE` terhadap `jobs(url UNIQUE)`.
-7. Mode default **preview/read-only** (tidak membuat tabel, tidak menambah job, tidak memicu alert BIMA). `--apply` adalah tindakan opt-in tersendiri.
-8. Unit service/timer Linux disediakan sebagai *file di repo*, tetapi tidak diinstal atau diaktifkan oleh `git pull`.
-
-**Belum (fase berikutnya):**
-
-- Sinkronisasi `urls.json` langsung dari Registry; domain baru yang belum masuk file tidak terjamin tercakup.
-- Discovery via search engine, passive DNS, urlscan.io, dan threat intelligence otomatis.
-- *Risk-based re-crawling*, deteksi perubahan DNS, skor AI khusus phishing/malware, dan dashboard SOC.
-- Pembatasan menyeluruh atas redirect dan resource pihak ketiga **di proses crawler lama**: `crawler_multi.py` saat ini bisa mengikuti redirect ke luar `.id` dan browser dapat mengakses sumber daya eksternal. Filter `.id` pada **discovery** bukan firewall keseluruhan. **Jangan aktifkan --apply produksi sampai kebijakan scope, browser, dan egress diselesaikan.**
-
-**Catatan akurasi:** `priority_score` hanya memprioritaskan pemeriksaan, **bukan vonis abuse**. Semua keputusan klasifikasi tetap diserahkan ke classifier BIMA/IndoBERT dengan verifikasi yang sesuai. Mesin discovery menghormati `robots.txt` untuk host utama saat memanen URL.
-
-## 3. Isi patch
+## 2. Paket v4
 
 ```text
 README_PROACTIVE_DISCOVERY.md
-multi/proactive_discovery.py
+multi/proactive_discovery.py                     # v3 + bounded URL probe
+multi/recrawl_scheduler.py                       # new read-only-by-default recrawl
+multi/routine_queue.py                           # handle old pending IDs after cursor
+tools/upgrade_bima_queue.py                     # adaptive, explicit queue fix (check/apply)
+multi/crawler_multi.py                           # patched separately by tool, NOT by Git patch
 multi/tests/test_proactive_discovery.py
-deploy/pandi-proactive-discovery.service
+multi/tests/test_recrawl_scheduler.py
+multi/tests/test_routine_queue.py
+deploy/pandi-proactive-discovery.service          # preview (never --apply)
 deploy/pandi-proactive-discovery.timer
-deploy/90-enable-proactive-enqueue.conf  # OPSIONAL, JANGAN PASANG SEKARANG
+deploy/90-enable-proactive-enqueue.conf           # optional; DON'T INSTALL
+
+deploy/pandi-bima-recrawl.service                # preview (never --apply)
+deploy/pandi-bima-recrawl.timer
+deploy/90-enable-bima-recrawl.conf                # optional; DON'T INSTALL
 ```
 
-Hanya menambah **enam file baru**. Tidak menyentuh `crawler_url.py`, `crawler_multi.py`, model IndoBERT, `urls.json`, `config.json`, data SQLite, atau file unit service aktif.
+## 3. Discovery: what v4 can actually find
 
-## 4. Apply patch di Mac (rekomendasi)
+- Link URLs exposed in public homepage HTML, sitemap(s), `robots.txt`, and optional passive CT via crt.sh (`--ct` off by default; external provider receives a seed hostname).
+- With `--scan-web --probe-candidates 2`, inspect **up to 2 discovered same-host pages per seed** (highest heuristic priority first). This may reveal off-domain 302 redirects in `/promo/` even if the homepage looks benign.
+- `robots.txt` requirements are respected for link collection and probes; non-200/non-404 robots response fails closed for web fetch. No brute force or Chrome execution in discovery.
+- Capture HTTP 301/302/303/307/308 as observed; capture meta refresh and literal JS location expressions as **static hints** only.
+- Pin DNS-validated public IP when fetching `.id` pages. Never follow off-seed redirects from discovery; retain only sanitized destinations without query/fragment.
+- SQLite candidate queue uses `jobs(url UNIQUE)` and a separate pending-candidate holding area. Preview does not create/modify tables.
 
-Unduh `bima-proactive-id-v2.patch` ke `~/Downloads`.
+**Not included:** search engine feeds, urlscan integration, passive DNS providers, DNS-change monitoring, JavaScript execution confirmation, automatic Registry sync, or automatic alert adjudication.
+
+## 4. Recrawl behavior
+
+The new `multi/recrawl_scheduler.py` reads `jobs` and only considers URLs:
+
+- That are valid HTTP(S) `.id` and within the host inventory from `urls.json`, with no query/fragment;
+- Whose job has `status='complete'` **and** `risk='low_risk'`;
+- That were last checked at least **168 hours (7 days)** ago; OR have a **new external redirect observation** since that check and were last checked at least **24 hours** ago.
+
+The scheduler will **not** touch `alerted`, `pending_alert`, `inconclusive`, `browser_queued`, `http_inflight`, `retry_http`, or other statuses. Selection is bounded to 2,000 rows/category per run by default. With explicit live mode, it requeues max 10 old jobs/run (hard CLI maximum 50) and respects an overall `pending` backlog of 100. An audit row stores the previous status, risk, redacted final URL, attempts, timestamp and reason **before** the previous job state is cleared. Updates use `BEGIN IMMEDIATE` plus an exact status/risk/timestamp guard.
+
+**Cursor wrap fix:** in the existing `--telegram-checks --limit 0` mode the routine job cursor had been monotonic. A previously completed job requeued with an older ID would be invisible until restart. The opt-in upgrade tool `tools/upgrade_bima_queue.py --apply` inserts the import/call to `routine_queue.find_next_pending_job()` into `crawler_multi.py` so that, after exhausting higher IDs, the routine loop wraps to lower pending IDs. This change requires a **controlled restart of the crawler service once** after the code is pulled; mere `git pull` cannot reload running Python code.
+
+The scheduler makes no outbound network connections and does not load IndoBERT. Nevertheless, **live recrawl may cause BIMA alerts from the main crawler**, so explicit confirmation is required using *both* `--apply` and `--allow-live-rechecks`.
+
+## 5. Mac: apply compatible patch, adapt crawler, test, commit
+
+Use **only** `bima-proactive-v2-to-v4-compatible.patch` for an existing v2 branch. Git patch intentionally skips the file `multi/crawler_multi.py`, because its layout may differ from a generic v2 snapshot. Instead, the adaptive tool recognizes a known queue assignment in `submit_one()` and safely replaces **only that assignment**. It refuses unknown layouts, never overwrites the whole file, and compiles the prospective Python code before writing.
 
 ```bash
-cd ~/Projects/bima                # ganti sesuai path repo BIMA di Mac
+cd ~/Projects/bima
 
-git remote -v                    # pastikan remote oz213/bima.git
-git branch --show-current
-git status --short                # amankan perubahan lokal jika ada
+git status --short
+# Working tree should be clean before proceeding.
+git apply --check ~/Downloads/bima-proactive-v2-to-v4-compatible.patch
+git apply ~/Downloads/bima-proactive-v2-to-v4-compatible.patch
 
-git switch main
-git pull --ff-only origin main
+# Preview the one-file crawler change, then apply explicitly.
+python3 -B tools/upgrade_bima_queue.py --check
+python3 -B tools/upgrade_bima_queue.py --apply
 
-git apply --check ~/Downloads/bima-proactive-id-v2.patch
-git apply ~/Downloads/bima-proactive-id-v2.patch
+for suite in test_proactive_discovery.py test_recrawl_scheduler.py test_routine_queue.py test_queue_upgrade_compat.py; do
+  PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
+    -s multi/tests -p "$suite" -v || exit 1
+done
 
-# Python 3.10+; 28 unit test offline, tanpa dependensi tambahan
-python3 -m unittest discover -s multi/tests -p 'test_proactive_discovery.py' -v
-
-# Lint/check patch dan staged diff
+python3 -B -c "import ast; from pathlib import Path; ast.parse(Path('multi/crawler_multi.py').read_text())"
 git diff --check
-git add README_PROACTIVE_DISCOVERY.md multi/proactive_discovery.py \
-    multi/tests/test_proactive_discovery.py \
-    deploy/pandi-proactive-discovery.service \
-    deploy/pandi-proactive-discovery.timer \
-    deploy/90-enable-proactive-enqueue.conf
+git status --short
+
+# Stage only source/docs/config templates; NOT urls.json, SQLite or secrets.
+git add -- README_PROACTIVE_DISCOVERY.md multi/proactive_discovery.py \
+  multi/recrawl_scheduler.py multi/routine_queue.py multi/crawler_multi.py \
+  multi/tests/test_proactive_discovery.py multi/tests/test_recrawl_scheduler.py \
+  multi/tests/test_routine_queue.py multi/tests/test_queue_upgrade_compat.py \
+  tools/upgrade_bima_queue.py deploy/pandi-proactive-discovery.service \
+  deploy/pandi-proactive-discovery.timer deploy/90-enable-proactive-enqueue.conf \
+  deploy/pandi-bima-recrawl.service deploy/pandi-bima-recrawl.timer \
+  deploy/90-enable-bima-recrawl.conf
+
 git diff --cached --check
 git diff --cached --stat
-
-git commit -m "feat: discover .id URLs and subdomains from registry seeds"
+git commit -m "feat: upgrade .id discovery and recrawl to v4"
 git push origin main
 ```
 
-**Jangan** `git add .` untuk kasus ini. `urls.json`, token Telegram, `config.json`, model privat, dan DB produksi tidak boleh masuk commit. Repo GitHub saat dicek masih berstatus public; pastikan kebijakan visibilitas repository sudah sesuai.
+**If the upgrade tool reports an unknown queue layout, do not force the change.** Send only the `submit_one()` function and top imports for an exact adapter update. The other files may already have been applied safely, and `git status --short` shows what changed. No production services are started by these steps.
 
-Jika `main` dilindungi atau ada konflik, kerjakan di branch `feature/proactive-id-discovery`, lalu merge lewat PR; server baru menarik branch tujuan setelah merge. Jangan paksa push.
-
-## 5. Setelah push, di server hanya perlu `git pull` untuk mengambil kode
+## 6. Server: pull, validate, and preview only
 
 ```bash
 cd /home/fauzi/crawler-rebuild
 
-git status --short          # tinjau; jangan timpa file lokal yang dimodifikasi
+git status --short
 git branch --show-current
-
-# Sesuaikan user yang memiliki checkout. Jangan pakai sudo bila sudah login fauzi.
 sudo -u fauzi git pull --ff-only origin main
 
-sudo -u fauzi -H ./venv/bin/python3 -B -m unittest discover \
-  -s multi/tests -p test_proactive_discovery.py -v
-```
+# Verify that the service user can read sources and input
+sudo -u fauzi test -r crawler_url.py && echo 'crawler engine readable'
+sudo -u fauzi test -r urls.json && echo 'Registry baseline readable'
 
-**Kode dan test sudah ada setelah pull.** Unit systemd dan timer di `/etc/systemd/system` **tidak otomatis ikut terpasang** (instalasi satu kali dijelaskan di bawah). Tidak ada restart service crawler atau Telegram Monitor yang diperlukan untuk menarik kode discovery saja.
+for suite in test_proactive_discovery.py test_recrawl_scheduler.py test_routine_queue.py; do
+  sudo -u fauzi -H ./venv/bin/python3 -B -m unittest discover \
+    -s multi/tests -p "$suite" -v || exit 1
+done
 
-## 6. Uji discovery manual di server tanpa menambah antrean
-
-Periksa crawler sudah sehat (error permission `crawler_url.py` sebelumnya harus diselesaikan lebih dahulu):
-
-```bash
-systemctl is-active pandi-crawler-multi.service pandi-telegram-monitor.service
-sudo -u fauzi test -r /home/fauzi/crawler-rebuild/urls.json && echo 'urls readable'
-sudo -u fauzi test -r /home/fauzi/crawler-rebuild/crawler_url.py && echo 'engine readable'
-```
-
-Preview offline (cek seed dan JSON saja, tidak ada akses situs):
-
-```bash
-cd /home/fauzi/crawler-rebuild
+# Discovery preview (no database write, but performs bounded .id HTTP fetches)
 sudo -u fauzi -H ./venv/bin/python3 -B multi/proactive_discovery.py \
   --input urls.json --db multi/state/crawler_production.sqlite3 \
-  --seed-limit 20
-```
+  --scan-web --seed-limit 3 --max-candidates-per-seed 20 \
+  --probe-candidates 2 --max-sitemaps 2
 
-Preview jaringan (hanya homepage/robots/sitemap dari seed `.id`, dan hanya HTTP(S) publik yang tervalidasi):
-
-```bash
-sudo -u fauzi -H ./venv/bin/python3 -B multi/proactive_discovery.py \
+# Recrawl preview (metadata-only, NO network and NO database write)
+sudo -u fauzi -H ./venv/bin/python3 -B multi/recrawl_scheduler.py \
   --input urls.json --db multi/state/crawler_production.sqlite3 \
-  --scan-web --seed-limit 5 --max-candidates-per-seed 20 \
-  --max-new 10 --max-pending 1000
+  --max-rechecks 10 --max-pending 100
 ```
 
-**Tanpa `--apply`, tidak ada penambahan job maupun perubahan cursor.** Karena itu preview akan mengulang batch yang sama sampai diberi `--start-index` berbeda, atau digunakan mode `--apply` setelah review.
+Pulling code does not automatically install systemd units or launch new services. **Do not activate optional live overrides until the network/SSRF/alert policy is approved.** A one-time controlled restart of `pandi-crawler-multi.service` is necessary if old-ID cursor wrap behavior is needed with a running crawler; first resolve the earlier `Permission denied` for `crawler_url.py` as user `fauzi`.
 
-Untuk melihat batch berbeda tanpa perubahan database:
+To install preview-only timers *after a successful staging review*:
 
 ```bash
-sudo -u fauzi -H ./venv/bin/python3 -B multi/proactive_discovery.py \
-  --input urls.json --db multi/state/crawler_production.sqlite3 \
-  --scan-web --seed-limit 5 --start-index 100
+sudo install -m 0644 deploy/pandi-proactive-discovery.service /etc/systemd/system/
+sudo install -m 0644 deploy/pandi-proactive-discovery.timer /etc/systemd/system/
+sudo install -m 0644 deploy/pandi-bima-recrawl.service /etc/systemd/system/
+sudo install -m 0644 deploy/pandi-bima-recrawl.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+# Optional, explicitly enabled by the operator (preview-only):
+# sudo systemctl enable --now pandi-proactive-discovery.timer
+# sudo systemctl enable --now pandi-bima-recrawl.timer
 ```
 
-CT pasif bersifat **opsional** dan tidak berjalan kecuali `--ct` diminta. Gunakan dulu pada jumlah domain kecil dan setelah persetujuan penggunaan feed eksternal:
+**Do not install** `deploy/90-enable-proactive-enqueue.conf` or `deploy/90-enable-bima-recrawl.conf` in production now; these are examples with `--apply`. The main crawler's existing API might generate **real BIMA alerts** after new/requeued jobs are processed. Backup SQLite and consider `--dry-run` on the crawler if testing live recrawl in staging; do not run two crawler instances against the same DB.
 
-```bash
-sudo -u fauzi -H ./venv/bin/python3 -B multi/proactive_discovery.py \
-  --input urls.json --db multi/state/crawler_production.sqlite3 \
-  --ct --seed-limit 2 --timeout 8
-```
+## 7. Test results and known limitations
 
-Output berupa JSON dengan `candidate_urls`, `new_jobs` (selalu 0 dalam preview), `pending_before`, `pending_after`, `web_errors`, `ct_errors`, dan beberapa contoh kandidat. URL yang ditampilkan sudah tanpa query/fragment.
+Offline verification: **57/57 unit tests passed** (discovery/redirect, bounded probes, scope/IDN, queue/backpressure, safe recrawl, alert-state exclusions, cursor wrap). Tests do not verify TLS, real sites, Selenium behavior, actual model detection, or BIMA API delivery. Most importantly, the main crawler's browser DNS/egress/redirect safety is NOT solved by this patch.
 
-## 7. Instal service/timer satu kali (tetap PREVIEW)
-
-Khusus saat ingin menggunakan systemd; setelah `git pull`, jalankan sebagai root:
-
-```bash
-install -o root -g root -m 0644 \
-  /home/fauzi/crawler-rebuild/deploy/pandi-proactive-discovery.service \
-  /etc/systemd/system/pandi-proactive-discovery.service
-install -o root -g root -m 0644 \
-  /home/fauzi/crawler-rebuild/deploy/pandi-proactive-discovery.timer \
-  /etc/systemd/system/pandi-proactive-discovery.timer
-systemctl daemon-reload
-systemctl start pandi-proactive-discovery.service
-systemctl status pandi-proactive-discovery.service --no-pager -l
-journalctl -u pandi-proactive-discovery.service -n 30 --no-pager
-```
-
-Unit `Type=oneshot` selesai dengan status sukses `inactive (dead)` setelah eksekusi, berbeda dari service crawler yang terus berjalan. Jika mode preview cukup, jangan aktifkan timer tanpa alasan: preview tidak menyimpan cursor dan akan memeriksa batch awal yang sama setiap kali berjalan.
-
-Bila sudah waktunya menjadwalkan eksekusi (setelah disetujui), timer tersedia tetapi belum diaktifkan otomatis:
-
-```bash
-systemctl enable --now pandi-proactive-discovery.timer
-systemctl list-timers pandi-proactive-discovery.timer --all
-```
-
-## 8. Aktivasi --apply: PERLU REVIEW OPERASIONAL TERPISAH
-
-**Jangan lakukan langkah ini saat tahap pengujian di Mac atau preview server.** `--apply` memasukkan kandidat baru sebagai `jobs(status='pending')` ke database crawler produksi. Pada crawler non-`--dry-run`, job dapat langsung diambil dan menghasilkan alert nyata ke BIMA.
-
-File opsional `deploy/90-enable-proactive-enqueue.conf` mengubah ExecStart untuk menambahkan `--apply`. Simpan file ini di Git untuk diaudit, tetapi **jangan salin ke systemd sebelum** keamanan redirect/browser, pembatasan egress, verifikasi alert, kapasitas antrean dan otorisasi pemrosesan disetujui. Lakukan smoke test pada DB terpisah, dan mulai dengan `--max-new` kecil.
-
-Untuk rollback layanan discovery saja (tidak menghapus job BIMA yang telah diproses):
-
-```bash
-systemctl disable --now pandi-proactive-discovery.timer
-systemctl stop pandi-proactive-discovery.service
-```
-
-Jangan hapus `jobs` atau `proactive_discovery_candidates` dari SQLite produksi tanpa rencana backup dan rekonsiliasi.
-
-## 9. Pengujian dan batasan
-
-Pengujian offline dijalankan dengan Python 3.13 pada modul ini (kode ditargetkan kompatibel Python 3.10+), dan mensimulasikan HTTP maupun SQLite: **28/28 lulus**. Ini bukan uji langsung terhadap `urls.json` produksi, internet, sistem BIMA, model IndoBERT, sistemd, maupun integrasi browser server.
-
-Beberapa keterbatasan disengaja untuk keamanan:
-
-- Penelusuran link hanya satu tingkat dari homepage plus sitemap, tidak melaksanakan brute force dan tidak mengikuti JavaScript/SPA; situs kompromi tersembunyi mungkin belum tertangkap.
-- HTTP 403 pada `robots.txt` atau robots tidak dapat dijangkau menyebabkan pemanenan konten web dilewati; ini konservatif untuk menjaga kebijakan crawl.
-- URL dengan query dihapus untuk mengurangi kemungkinan kebocoran token dan ledakan jumlah target; risiko pada query-only route mungkin terlewat.
-- CT tidak mengandung semua subdomain, dan API publik memiliki kuota/availability tersendiri.
-- Daftar Registry yang diisi manual bisa menjadi usang. Otomasi feed read-only dari Registry merupakan pengembangan berikutnya setelah ada akses/skema resmi.
-- **Tidak melakukan crawling internet global.** CT merupakan kueri ke API pihak ketiga untuk **nama domain `.id` saja**, bukan perluasan scanning ke TLD lain.
-
-## 10. Prioritas fase selanjutnya
-
-1. Memperbaiki perimeter `.id` pada **crawler utama**, termasuk pemeriksaan redirect, Selenium, dan konfigurasi firewall egress.
-2. Mengembangkan discovery dari indeks pencarian publik / feed threat intelligence khusus indikator `.id`.
-3. Menambahkan antrian *review* dan workflow konfirmasi untuk mencegah auto-report dari temuan yang belum diverifikasi.
-4. Sinkronisasi read-only domain ber-NS dari Registry; atur jadwal/sumber tanpa menaruh akses database Registry pada repo publik.
-5. Integrasi SOC dan dashboard tren, termasuk klasifikasi phishing dan malware terpisah dari model judi online.
+Search-engine, passive-DNS and threat-intelligence providers can be integrated in later phases. Registry sync remains a separate read-only integration; while `urls.json` is manually updated the baseline inventory may miss newly delegated domains.

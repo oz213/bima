@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily preview of PANDI BIMA .id safe rechecks
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=600
+Persistent=true
+Unit=pandi-bima-recrawl.service
+
+[Install]
+WantedBy=timers.target

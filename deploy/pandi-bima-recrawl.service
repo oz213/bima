@@ -1,0 +1,23 @@
+[Unit]
+Description=PANDI BIMA Safe .id Recrawl Scheduler (PREVIEW ONLY)
+ConditionPathExists=/home/fauzi/crawler-rebuild/urls.json
+ConditionPathExists=/home/fauzi/crawler-rebuild/multi/state/crawler_production.sqlite3
+
+[Service]
+Type=oneshot
+User=fauzi
+Group=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B multi/recrawl_scheduler.py --input urls.json --db multi/state/crawler_production.sqlite3 --max-rechecks 10 --max-pending 100 --regular-hours 168 --redirect-hours 24
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ReadWritePaths=/home/fauzi/crawler-rebuild/multi/state
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

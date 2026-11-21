@@ -207,6 +207,166 @@ class NetworkSafetyTests(unittest.TestCase):
         self.assertEqual(FakeConn.calls, 1)
 
 
+class RedirectDetectionTests(unittest.TestCase):
+    def test_redirect_target_is_redacted_and_not_enqueued_as_global_domain(self):
+        item = discovery.make_redirect(
+            'https://contoh.id/', 'https://judol.example/landing?token=topsecret#x',
+            seed='contoh.id', method='http', status=302)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.source_url, 'https://contoh.id/')
+        self.assertEqual(item.destination_url, 'https://judol.example/landing')
+        self.assertTrue(item.external)
+        self.assertEqual(item.http_status, 302)
+        self.assertIsNone(discovery.make_candidate(item.destination_url,
+                seed='contoh.id', source='redirect'))
+
+    def test_invalid_redirect_targets_are_rejected(self):
+        for destination in ('javascript:alert(1)', 'file:///etc/passwd',
+                            'http://127.0.0.1/admin', 'http://localhost/admin',
+                            'http://user:password@example.com/',
+                            'https://example.com:8080/private'):
+            with self.subTest(destination=destination):
+                self.assertIsNone(discovery.make_redirect(
+                    'https://contoh.id/', destination, seed='contoh.id',
+                    method='http', status=302))
+
+    def test_meta_refresh_and_static_javascript_patterns(self):
+        html = '''<html><head><meta http-equiv="refresh" content="0;url=https://outside.example/slot?k=secret"/></head>
+        <body><script>window.location.href="https://other.example/path";
+        location.replace('/internal'); location.assign('https://another.example/path?code=ABC');</script></body></html>'''
+        observations = discovery.inspect_html_redirects(
+            html, page_url='https://contoh.id/', seed='contoh.id')
+        self.assertEqual(len(observations), 4)
+        self.assertEqual({o.method for o in observations}, {'meta_refresh', 'js_literal'})
+        self.assertTrue(any(o.destination_url == 'https://outside.example/slot'
+                            for o in observations))
+        self.assertTrue(any(not o.external for o in observations))
+        self.assertNotIn('secret', str(observations))
+        self.assertNotIn('ABC', str(observations))
+
+    def test_static_patterns_not_a_runtime_confirmation(self):
+        html = '<script src="https://external.example/a.js"></script><a href="https://external.example">go</a>'
+        self.assertEqual(discovery.inspect_html_redirects(html,
+            page_url='https://contoh.id/', seed='contoh.id'), ())
+
+    def test_external_http_redirect_records_without_following(self):
+        class RedirectResponse:
+            status = 302
+            def getheader(self, name, default=''):
+                return 'https://external.example/page?session=secret' if name == 'Location' else default
+        class FakeConn:
+            calls = 0
+            def __init__(self, *args):
+                FakeConn.calls += 1
+            def request(self, *args, **kwargs): pass
+            def getresponse(self): return RedirectResponse()
+            def close(self): pass
+        with patch.object(discovery, 'public_ip_for', return_value='8.8.8.8'), \
+             patch.object(discovery, 'PinnedHTTPSConnection', FakeConn):
+            result = discovery.SafeFetcher(timeout=1, max_bytes=1024,
+                        min_host_interval=0).get('https://contoh.id/', seed='contoh.id')
+        self.assertEqual(result.error, 'redirect_out_of_scope')
+        self.assertEqual(len(result.redirects), 1)
+        self.assertEqual(result.redirects[0].destination_url, 'https://external.example/page')
+        self.assertEqual(FakeConn.calls, 1)
+
+    def test_multihop_internal_then_external_within_budget(self):
+        class RedirectResponse:
+            status = 302
+            def __init__(self, target): self.target = target
+            def getheader(self, name, default=''):
+                return self.target if name == 'Location' else default
+        class FakeConn:
+            calls = []
+            def __init__(self, *args): pass
+            def request(self, method, path, **kwargs):
+                self.path = path
+                FakeConn.calls.append(path)
+            def getresponse(self):
+                return RedirectResponse('/step') if self.path == '/' else RedirectResponse('https://outside.example/')
+            def close(self): pass
+        with patch.object(discovery, 'public_ip_for', return_value='8.8.8.8'), \
+             patch.object(discovery, 'PinnedHTTPSConnection', FakeConn):
+            result = discovery.SafeFetcher(timeout=1, max_bytes=1024,
+                min_host_interval=0).get('https://contoh.id/', seed='contoh.id')
+        self.assertEqual(FakeConn.calls, ['/', '/step'])
+        self.assertEqual(result.error, 'redirect_out_of_scope')
+        self.assertEqual(len(result.redirects), 2)
+        self.assertFalse(result.redirects[0].external)
+        self.assertTrue(result.redirects[1].external)
+
+    def test_internal_redirect_query_is_sent_but_never_stored(self):
+        class Response:
+            def __init__(self, status, dest=''):
+                self.status, self.dest = status, dest
+            def getheader(self, name, default=''):
+                if name == 'Location': return self.dest
+                if name == 'Content-Type': return 'text/html'
+                return default
+            def read(self, count): return b'<html>safe</html>'
+        class FakeConn:
+            calls = []
+            def __init__(self, *args): pass
+            def request(self, method, path, **kwargs):
+                self.path = path
+                FakeConn.calls.append(path)
+            def getresponse(self):
+                if self.path == '/':
+                    return Response(302, '/next?ticket=keepsecret')
+                return Response(200)
+            def close(self): pass
+        with patch.object(discovery, 'public_ip_for', return_value='8.8.8.8'), \
+             patch.object(discovery, 'PinnedHTTPSConnection', FakeConn):
+            result = discovery.SafeFetcher(timeout=1, max_bytes=1024,
+                 min_host_interval=0).get('https://contoh.id/', seed='contoh.id')
+        self.assertEqual(FakeConn.calls, ['/', '/next?ticket=keepsecret'])
+        self.assertEqual(result.final_url, 'https://contoh.id/next')
+        self.assertEqual(result.redirects[0].destination_url, 'https://contoh.id/next')
+        self.assertNotIn('keepsecret', str(result))
+
+    def test_discovery_callback_reports_redirect_event(self):
+        target = discovery.make_redirect('https://contoh.id/',
+                    'https://outside.example/', seed='contoh.id',
+                    method='http', status=302)
+        seen = []
+        def fetch(url):
+            path = discovery.urlsplit(url).path
+            if path == '/robots.txt':
+                return discovery.FetchResult(404, url, '')
+            if path == '/':
+                return discovery.FetchResult(302, url, '', 'redirect_out_of_scope', (target,))
+            return discovery.FetchResult(404, url, '')
+        _, counters = discovery.discover_seed('contoh.id', fetch=fetch,
+                                             redirect_observer=seen.append)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(counters['external_redirects'], 1)
+        self.assertEqual(counters['redirect_observations'], 1)
+
+    def test_persist_redirect_observation_without_auto_alert(self):
+        with tempfile.TemporaryDirectory() as dirname:
+            db = Path(dirname) / 'jobs.sqlite3'
+            conn = sqlite3.connect(db)
+            conn.execute('CREATE TABLE jobs (id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE, '
+                         "status TEXT NOT NULL DEFAULT 'pending', updated_at TEXT)")
+            conn.commit()
+            item = discovery.make_redirect('https://contoh.id/',
+                 'https://outside.example/landing?token=hidden',
+                 seed='contoh.id', method='http', status=302)
+            discovery.apply_candidates(conn, candidates=[], input_digest='digest',
+                next_cursor=1, max_new=10, max_pending=100, redirects=[item])
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+            rows = conn.execute('SELECT destination_url,review_status FROM '
+                                'proactive_redirect_observations').fetchall()
+            self.assertEqual(rows, [('https://outside.example/landing', 'new')])
+            conn.execute("UPDATE proactive_redirect_observations SET review_status='reviewed'")
+            conn.commit()
+            discovery.apply_candidates(conn, candidates=[], input_digest='digest',
+                next_cursor=2, max_new=10, max_pending=100, redirects=[item])
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM proactive_redirect_observations').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT review_status FROM proactive_redirect_observations').fetchone()[0], 'reviewed')
+            conn.close()
+
+
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -323,6 +483,56 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(discovery.state_of(conn)[1], 1)
         finally:
             conn.close()
+
+
+class CandidateProbeTests(unittest.TestCase):
+    def test_probe_first_scored_page_and_save_redirect_observation(self):
+        contacted = []
+        observed = []
+        def fetch(url):
+            contacted.append(url)
+            path = discovery.urlsplit(url).path
+            if path == '/robots.txt':
+                return discovery.FetchResult(404, url, '')
+            if path == '/':
+                return discovery.FetchResult(200, url,
+                    '<a href="/slot/">target</a><a href="/about/">about</a>'
+                    '<a href="https://another.contoh.id/promo">other host</a>')
+            if path == '/slot/':
+                item = discovery.make_redirect(url, 'https://elsewhere.example/landing?key=secret',
+                                               seed='contoh.id', method='http', status=302)
+                return discovery.FetchResult(302, url, '', 'redirect_out_of_scope', (item,))
+            return discovery.FetchResult(200, url, 'normal')
+        candidates, counts = discovery.discover_seed(
+            'contoh.id', fetch=fetch, max_sitemaps=0, probe_candidates=1,
+            redirect_observer=observed.append)
+        self.assertEqual(counts['probed_pages'], 1)
+        self.assertEqual(counts['external_redirects'], 1)
+        self.assertEqual(counts['probe_errors'], 0)
+        self.assertIn('https://contoh.id/slot/', contacted)
+        self.assertNotIn('https://contoh.id/about/', contacted)
+        self.assertNotIn('https://another.contoh.id/promo', contacted)
+        self.assertEqual(observed[0].destination_url, 'https://elsewhere.example/landing')
+
+    def test_robots_excluded_page_never_probed(self):
+        contacted = []
+        def fetch(url):
+            contacted.append(url)
+            path = discovery.urlsplit(url).path
+            if path == '/robots.txt':
+                return discovery.FetchResult(200, url, 'User-agent: *\nDisallow: /private\n')
+            if path == '/':
+                return discovery.FetchResult(200, url,
+                    '<a href="/private/slot">bad</a><a href="/public/promo">good</a>')
+            return discovery.FetchResult(200, url, '')
+        _, counts = discovery.discover_seed(
+            'contoh.id', fetch=fetch, max_sitemaps=0, probe_candidates=2)
+        self.assertEqual(counts['probed_pages'], 1)
+        self.assertNotIn('https://contoh.id/private/slot', contacted)
+        self.assertIn('https://contoh.id/public/promo', contacted)
+
+    def test_probe_default_off(self):
+        self.assertEqual(discovery.arg_parser().parse_args([]).probe_candidates, 0)
 
 
 if __name__ == '__main__':

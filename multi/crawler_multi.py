@@ -32,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
+from routine_queue import find_next_pending_job
 
 _HTTP_LOCAL = threading.local()
 _INFERENCE_LOCK = threading.Lock()
@@ -1034,9 +1035,7 @@ def run(args):
                 # Leave capacity for interactive work when Selenium is backlogged.
                 if interactive and priority is None and waiting_browser + len(futures) >= args.browser_queue_size:
                     return False
-                row = priority or conn.execute(
-                    "SELECT id,url FROM jobs WHERE status='pending' AND id>? ORDER BY id LIMIT 1",
-                    (last_id,)).fetchone()
+                row = priority or find_next_pending_job(conn, last_id, wrap=interactive)
                 if row is None:
                     return False
                 id_, url = row

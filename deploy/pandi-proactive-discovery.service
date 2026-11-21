@@ -11,7 +11,7 @@ User=fauzi
 Group=fauzi
 WorkingDirectory=/home/fauzi/crawler-rebuild
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B multi/proactive_discovery.py --input urls.json --db multi/state/crawler_production.sqlite3 --scan-web --seed-limit 20 --max-candidates-per-seed 30 --max-new 20 --max-pending 1000
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B multi/proactive_discovery.py --input urls.json --db multi/state/crawler_production.sqlite3 --scan-web --probe-candidates 2 --seed-limit 20 --max-candidates-per-seed 30 --max-new 20 --max-pending 1000
 TimeoutStartSec=600
 UMask=0077
 NoNewPrivileges=true
