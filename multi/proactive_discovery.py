@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from html.parser import HTMLParser
+from redirect_intelligence import analyze_html, build_redirect_chains
 import http.client
 import ipaddress
 import json
@@ -328,6 +329,8 @@ class FetchResult:
     text: str
     error: str = ''
     redirects: tuple[RedirectObservation, ...] = ()
+    # Passive hints, not verified JavaScript navigation or abuse findings.
+    js_review_hints: tuple[str, ...] = ()
 
 
 # Fallback is a deliberate opt-in, not a way to bypass robots access rules.
@@ -359,6 +362,8 @@ def fetch_failure_kind(result: FetchResult) -> str:
         return 'connection'
     if result.error == 'redirect_origin_requires_robots':
         return 'origin_policy_required'
+    if result.error == 'robots_redirect_disallow':
+        return 'robots_denied_redirect'
     if result.error == 'redirect_out_of_scope':
         return 'external_redirect'
     if result.error in ('out_of_scope', 'redirect_invalid', 'ValueError',
@@ -415,18 +420,22 @@ def public_ip_for(host: str, port: int) -> str:
 class SafeFetcher:
     """Fetch only .id hosts, but *record* off-scope redirect targets."""
     def __init__(self, *, timeout: float, max_bytes: int, max_redirects: int = 3,
-                 min_host_interval: float = 0.5):
+                 min_host_interval: float = 0.5, advanced_js: bool = False):
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.max_redirects = max_redirects
         self.min_host_interval = min_host_interval
+        self.advanced_js = advanced_js
         self._next_host_access: dict[str, float] = {}
 
-    def get(self, url: str, *, seed: str) -> FetchResult:
+    def get(self, url: str, *, seed: str,
+            redirect_allowed: Callable[[str], bool] | None = None) -> FetchResult:
         current = normalize_url(url)
         if current is None or not within_seed(current, seed):
             return FetchResult(0, url, '', 'out_of_scope')
         observed: list[RedirectObservation] = []
+        if redirect_allowed is None:
+            redirect_allowed = getattr(self, '_redirect_allowed', None)
         for _ in range(self.max_redirects + 1):
             parsed = urlsplit(current)
             port = 443 if parsed.scheme == 'https' else 80
@@ -468,11 +477,18 @@ class SafeFetcher:
                     if (origin.scheme, origin.hostname) != (target.scheme, target.hostname):
                         return FetchResult(status, normalize_url(current) or current, '',
                                            'redirect_origin_requires_robots', tuple(observed))
+                    # Every redirect within the checked origin must also obey
+                    # the origin's robots policy before connecting to its path.
+                    # Query may be used for the robots decision, but never logged.
+                    next_url = urljoin(current, destination.strip())
+                    if redirect_allowed is not None and not redirect_allowed(next_url):
+                        return FetchResult(status, normalize_url(current) or current,
+                                           '', 'robots_redirect_disallow', tuple(observed))
                     # Follow internal same-origin redirects, maintaining IP pinning
                     # and public-IP checks at every single network connection.
                     # Keep an in-scope redirect's query during the HTTP request;
                     # do not record it in redirect evidence or output.
-                    resolved = urlsplit(urljoin(current, destination.strip()))
+                    resolved = urlsplit(next_url)
                     current = urlunsplit((urlsplit(item.destination_url).scheme,
                                           urlsplit(item.destination_url).netloc,
                                           urlsplit(item.destination_url).path,
@@ -490,9 +506,28 @@ class SafeFetcher:
                 if len(raw) > self.max_bytes:
                     return FetchResult(status, normalize_url(current) or current, '', 'oversize', tuple(observed))
                 text = raw.decode('utf-8', 'replace')
+                hints: set[str] = set()
                 if 'html' in ct:
                     observed.extend(inspect_html_redirects(text, page_url=current, seed=seed))
-                return FetchResult(status, normalize_url(current) or current, text, '', tuple(observed))
+                    if self.advanced_js:
+                        # Advanced signals are *passive*. External destinations are
+                        # never fetched, and static JS is not runtime confirmation.
+                        already_seen = {(x.source_url, x.destination_url)
+                                        for x in observed if x.method == 'js_literal'}
+                        for signal in analyze_html(text):
+                            if signal.kind == 'js_dynamic':
+                                hints.add('js_dynamic_location')
+                                continue
+                            if signal.kind == 'js_literal':
+                                # Preserve legacy literal parser's observations.
+                                continue
+                            item = make_redirect(current, signal.target or '',
+                                                 seed=seed, method=signal.kind)
+                            if item and (item.source_url, item.destination_url) not in already_seen:
+                                observed.append(item)
+                                already_seen.add((item.source_url, item.destination_url))
+                return FetchResult(status, normalize_url(current) or current, text,
+                                   '', tuple(observed), tuple(sorted(hints)))
             except (OSError, ValueError, ssl.SSLError, http.client.HTTPException) as exc:
                 return FetchResult(0, normalize_url(current) or current, '', type(exc).__name__, tuple(observed))
             finally:
@@ -568,8 +603,10 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                   max_candidates: int = 30, max_sitemaps: int = 2,
                   probe_candidates: int = 0,
                   redirect_observer: Callable[[RedirectObservation], None] | None = None,
+                  fetch_with_robots: Callable[[str, object | None], FetchResult] | None = None,
                   http_fallback: bool = False,
                   canonical_www: bool = False,
+                  browser_review_limit: int = 0,
                   ) -> tuple[list[Candidate], dict]:
     """Conservative discovery; never trust apex robots for a www origin.
 
@@ -588,7 +625,9 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 'canonical_www_attempts': 0, 'canonical_www_verified': 0,
                 'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
                 'robots_reasons': {}, 'http_response_codes': {},
-                'redirect_stop_reasons': {}}
+                'redirect_stop_reasons': {}, 'js_static_redirects': 0,
+                'js_dynamic_pages': 0, 'browser_review_candidates': []}
+    review_by_key: dict[tuple[str, str, str], dict] = {}
     last_robots_reason = 'not_checked'
     homepage_status = 'not_checked'
 
@@ -596,20 +635,55 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         group = counters[key]
         group[value] = group.get(value, 0) + 1
 
+    def add_review(source: str, reason: str, score: int, destination: str = ''):
+        if browser_review_limit <= 0:
+            return
+        # Only redacted .id source URLs and redacted evidence destinations.
+        safe_source = normalize_url(source)
+        if safe_source is None:
+            return
+        key = (safe_source, reason, destination)
+        review_by_key[key] = {'source': safe_source, 'reason': reason,
+                              'priority': score, 'destination': destination or None}
+
     def observe(result: FetchResult):
         if result.status:
             tally('http_response_codes', str(result.status))
         if result.error in ('redirect_origin_requires_robots', 'redirect_out_of_scope',
-                            'redirect_limit', 'redirect_invalid'):
+                            'redirect_limit', 'redirect_invalid', 'robots_redirect_disallow'):
             tally('redirect_stop_reasons', result.error)
+        if result.js_review_hints:
+            counters['js_dynamic_pages'] += 1
+            for reason in result.js_review_hints:
+                add_review(result.final_url, reason, 30)
         for item in result.redirects:
             counters['redirect_observations'] += 1
             counters['external_redirects'] += int(item.external)
+            if item.method.startswith('js_'):
+                counters['js_static_redirects'] += 1
+            # robots.txt redirects are access-control events, not a browser
+            # verification priority signal for the website's actual content.
+            if item.external and not urlsplit(item.source_url).path.endswith('/robots.txt'):
+                if item.method == 'http':
+                    add_review(item.source_url, 'external_http_redirect', 95,
+                               item.destination_url)
+                elif item.method == 'meta_refresh':
+                    add_review(item.source_url, 'external_meta_refresh', 85,
+                               item.destination_url)
+                elif item.method.startswith('js_'):
+                    add_review(item.source_url, 'external_js_static', 75,
+                               item.destination_url)
             if redirect_observer is not None:
                 redirect_observer(item)
 
     def note_failure(result: FetchResult):
         tally('fetch_failure_types', fetch_failure_kind(result))
+
+    def fetch_page(url: str):
+        # Production provides a SafeFetcher wrapper that enforces robots on
+        # *each* same-origin HTTP redirect; mocks keep their existing API.
+        return (fetch_with_robots(url, robots_policy)
+                if fetch_with_robots is not None else fetch(url))
 
     def add(value: str, source: str):
         item = make_candidate(value, seed=seed, source=source)
@@ -716,7 +790,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
             counters['web_errors'] += 1
         else:
             homepage_origin = root_url
-            homepage = fetch(root_url)
+            homepage = fetch_page(root_url)
             counters['web_requests'] += 1
             observe(homepage)
             if homepage.status != 200 or homepage.error:
@@ -726,7 +800,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
             if canonical is not None:
                 allowed, robots_policy, sitemaps, robots, root_url = canonical
                 if allowed:
-                    homepage = fetch(root_url)
+                    homepage = fetch_page(root_url)
                     counters['web_requests'] += 1
                     observe(homepage)
                     if homepage.status != 200 or homepage.error:
@@ -746,7 +820,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 if http_allowed:
                     allowed = True
                     robots_policy, sitemaps, root_url = http_policy, http_maps, http_root
-                    homepage = fetch(root_url)
+                    homepage = fetch_page(root_url)
                     counters['web_requests'] += 1
                     observe(homepage)
                     if homepage.status != 200 or homepage.error:
@@ -790,7 +864,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                     if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, sitemap):
                         continue
                     visited_sitemaps.add(sitemap)
-                    doc = fetch(sitemap)
+                    doc = fetch_page(sitemap)
                     counters['web_requests'] += 1
                     observe(doc)
                     if doc.status != 200 or doc.error or (urlsplit(doc.final_url).scheme,
@@ -816,7 +890,7 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                 break
             if robots_policy is not None and not robots_policy.can_fetch(USER_AGENT, item.url):
                 continue
-            result = fetch(item.url)
+            result = fetch_page(item.url)
             counters['probed_pages'] += 1
             counters['web_requests'] += 1
             observe(result)
@@ -830,6 +904,9 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
                                             item.seed_hostname,
                                             min(100, item.priority_score + 30))
         ordered = sorted(found.values(), key=lambda c: (-c.priority_score, c.url))[:max_candidates]
+    counters['browser_review_candidates'] = sorted(
+        review_by_key.values(), key=lambda item: (-item['priority'], item['source'],
+                                                   item['reason'], item['destination'] or ''))[:browser_review_limit]
     counters['diagnostic'] = {
         'seed': seed, 'selected_origin': root_url if allowed else None,
         'robots_outcome': last_robots_reason, 'homepage_outcome': homepage_status,
@@ -841,6 +918,8 @@ def discover_seed(seed: str, *, fetch: Callable[[str], FetchResult] | None,
         'canonical_www_attempts': counters['canonical_www_attempts'],
         'canonical_www_verified': counters['canonical_www_verified'],
         'canonical_www_blocked': counters['canonical_www_blocked'],
+        'js_static_redirects': counters['js_static_redirects'],
+        'js_dynamic_pages': counters['js_dynamic_pages'],
     }
     return ordered, counters
 
@@ -953,8 +1032,12 @@ def run(args) -> dict:
         current_seeds = [seeds[(start + i) % len(seeds)] for i in range(size)]
         next_cursor = (start + size) % len(seeds)
         before = pending_count(conn)
+        # Keep the v4.2.1 default constructor unchanged (also for integrations
+        # that provide their own SafeFetcher); opt in to advanced parsing.
+        fetcher_options = ({'advanced_js': True} if getattr(args, 'advanced_js', False) else {})
         fetcher = SafeFetcher(timeout=args.timeout, max_bytes=args.max_response_bytes,
-                              min_host_interval=args.min_host_interval)
+                              min_host_interval=args.min_host_interval,
+                              **fetcher_options)
         candidates: dict[str, Candidate] = {}
         stats = {'web_requests': 0, 'web_errors': 0, 'ct_errors': 0,
                  'redirect_observations': 0, 'external_redirects': 0,
@@ -964,7 +1047,9 @@ def run(args) -> dict:
                  'canonical_www_attempts': 0, 'canonical_www_verified': 0,
                  'canonical_www_blocked': 0, 'canonical_www_homepage_success': 0,
                  'robots_reasons': {}, 'http_response_codes': {},
-                 'redirect_stop_reasons': {}}
+                 'redirect_stop_reasons': {}, 'js_static_redirects': 0,
+                 'js_dynamic_pages': 0}
+        review_candidates: list[dict] = []
         seed_diagnostics: list[dict] = []
         redirects_by_key: dict[tuple[str, str, str], RedirectObservation] = {}
         def observe_redirect(item: RedirectObservation):
@@ -973,6 +1058,18 @@ def run(args) -> dict:
         for seed in current_seeds:
             def fetch(url: str, *, _seed=seed):
                 return fetcher.get(url, seed=_seed)
+            def fetch_with_robots(url: str, policy, *, _seed=seed):
+                # No policy (robots 404) means no disallow directives.
+                allowed_redirect = (lambda target: policy.can_fetch(USER_AGENT, target)) \
+                    if policy is not None else None
+                # Single-threaded Discovery: scope this policy to one request,
+                # without changing legacy SafeFetcher.get callers/mocks.
+                previous = getattr(fetcher, '_redirect_allowed', None)
+                fetcher._redirect_allowed = allowed_redirect
+                try:
+                    return fetcher.get(url, seed=_seed)
+                finally:
+                    fetcher._redirect_allowed = previous
             items, counters = discover_seed(
                 seed, fetch=fetch if args.scan_web else None,
                 include_ct=args.ct,
@@ -981,12 +1078,17 @@ def run(args) -> dict:
                 max_sitemaps=args.max_sitemaps,
                 probe_candidates=args.probe_candidates,
                 redirect_observer=observe_redirect,
+                fetch_with_robots=fetch_with_robots if args.scan_web else None,
                 http_fallback=getattr(args, 'http_fallback', False),
-                canonical_www=getattr(args, 'canonical_www', False))
+                canonical_www=getattr(args, 'canonical_www', False),
+                browser_review_limit=getattr(args, 'browser_review_limit', 0))
             if len(seed_diagnostics) < getattr(args, 'diagnostic_seeds', 0):
                 seed_diagnostics.append(counters['diagnostic'])
             for k, v in counters.items():
                 if k == 'diagnostic':
+                    continue
+                if k == 'browser_review_candidates':
+                    review_candidates.extend(v)
                     continue
                 if k in ('fetch_failure_types', 'robots_reasons',
                          'http_response_codes', 'redirect_stop_reasons'):
@@ -1021,8 +1123,17 @@ def run(args) -> dict:
             'pending_before': before, 'pending_after': after,
             'scan_web': args.scan_web, 'ct': args.ct,
             'http_fallback': getattr(args, 'http_fallback', False),
-            'canonical_www': getattr(args, 'canonical_www', False), **stats,
+            'canonical_www': getattr(args, 'canonical_www', False),
+            'advanced_js': getattr(args, 'advanced_js', False), **stats,
             'preview_diagnostics': seed_diagnostics if not args.apply else [],
+            'preview_browser_review': sorted(
+                {((item['source'], item['reason'], item['destination'] or '')): item
+                 for item in review_candidates}.values(),
+                key=lambda item: (-item['priority'], item['source'], item['reason']))
+                [:getattr(args, 'browser_review_limit', 0)] if not args.apply else [],
+            'preview_redirect_chains': build_redirect_chains(
+                redirect_events, limit=getattr(args, 'redirect_chain_preview', 0))
+                if not args.apply else [],
             'unique_redirects': len(redirect_events),
             'preview_redirects': [
                 {'source': item.source_url, 'destination': item.destination_url,
@@ -1049,6 +1160,12 @@ def arg_parser() -> argparse.ArgumentParser:
                         help='Opt-in: HTTPS transport failure -> HTTP only after separate robots check')
     parser.add_argument('--canonical-www', action='store_true',
                         help='Opt-in: independently check www.<seed>/robots.txt on apex redirect')
+    parser.add_argument('--advanced-js', action='store_true',
+                        help='Opt-in: passive decode of bounded inline JS navigation literals; no execution')
+    parser.add_argument('--browser-review-limit', type=int, default=0,
+                        help='Preview up to N manual browser review leads (0 disables; NO browser launched)')
+    parser.add_argument('--redirect-chain-preview', type=int, default=0,
+                        help='Preview up to N observed HTTP chains and passive JS/meta signals')
     parser.add_argument('--diagnostic-seeds', type=int, default=0,
                         help='Preview per-seed safe diagnostics for up to 100 seeds (0 disables)')
     parser.add_argument('--ct', action='store_true', help='Optional crt.sh public CT lookup (sends seed hostname)')
@@ -1083,6 +1200,14 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit('--http-fallback requires --scan-web')
     if args.canonical_www and not args.scan_web:
         raise SystemExit('--canonical-www requires --scan-web')
+    if args.advanced_js and not args.scan_web:
+        raise SystemExit('--advanced-js requires --scan-web')
+    if args.advanced_js and args.apply:
+        raise SystemExit('--advanced-js is preview-only in v4.3 (no --apply)')
+    if not 0 <= args.browser_review_limit <= 100 or not 0 <= args.redirect_chain_preview <= 100:
+        raise SystemExit('browser-review-limit/redirect-chain-preview must be 0..100')
+    if (args.browser_review_limit or args.redirect_chain_preview) and (not args.scan_web or args.apply):
+        raise SystemExit('browser review/chain preview requires --scan-web and preview (no --apply)')
     if not 0 <= args.diagnostic_seeds <= 100:
         raise SystemExit('--diagnostic-seeds must be between 0 and 100')
     if args.diagnostic_seeds and (not args.scan_web or args.apply):
