@@ -8,6 +8,11 @@
 
 Dokumen ini mencakup **instalasi baru**, **konfigurasi**, **crawling mulai dari 0%**, **deploy systemd**, **Telegram Monitor interaktif**, **laporan Telegram otomatis setiap 5 menit**, **backup/rollback**, **Git**, dan **troubleshooting**. Semua path `/home/fauzi/crawler-rebuild` di bawah merupakan contoh deployment yang digunakan pada server `registrar-sandbox.pandi.id`; sesuaikan pada host lain.
 
+Fitur tambahan: [BIMA sebagai asisten analis domain](README_BIMA_DOMAIN_ANALYST.md)
+menyediakan analisis bukti tersimpan melalui Telegram, dengan pilihan model
+percakapan yang diaktifkan melalui konfigurasi. Panduan mencakup alur Mac →
+GitHub → server, batas bukti, serta aktivasi monitor.
+
 
 > **PENTING — Produksi:** Crawler dapat mengirim alert nyata ke BIMA. Selalu gunakan `--dry-run` untuk pengujian dan **jangan menjalankan dua instance pada database atau antrean yang sama**. Saat migrasi dari proses lama, pastikan proses tersebut benar-benar berhenti sebelum menjalankan service baru. Database baru tidak memiliki riwayat deduplikasi BIMA.
 

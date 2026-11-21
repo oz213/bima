@@ -207,13 +207,19 @@ HELP = (
 )
 
 
-def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=None):
+def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=None,
+                   *, analyst_service=None, chat_type=None):
     parts = text.strip().split()
     command = (parts[0] if parts else '').split('@')[0].lower()
     if command in ('/id', '/start'):
         return f"Chat ID Anda: {chat_id}\nBerikan ID ini kepada admin bot untuk diizinkan."
     if chat_id not in allowed:
         return "Chat ini belum diizinkan. Kirim /id lalu daftarkan ID ke administrator."
+    if command in ('/analisis', '/tanya', '/bandingkan', '/lupakan'):
+        if os.environ.get('BIMA_ANALYST_ENABLED') != '1' or analyst_service is None:
+            return 'Fitur analisis belum diaktifkan oleh administrator.'
+        return analyst_service.handle(text, chat_id, sender_id, allowed,
+                                      update_id=update_id, chat_type=chat_type)
     if command in ('/review', '/bukti', '/pola'):
         from telegram_review import handle
         return handle(text, chat_id, sender_id, allowed, db_path)
@@ -229,6 +235,9 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
         check_id = request_check(db_path, url, chat_id, update_id)
         return f'Permintaan #{check_id} diterima. Hasil akan dikirim ke chat ini.'
     if command in ('/help', ''):
+        if os.environ.get('BIMA_ANALYST_ENABLED') == '1' and analyst_service is not None:
+            from telegram_analyst import HELP as ANALYST_HELP
+            return HELP + ANALYST_HELP
         return HELP
     if command not in ('/status','/inconclusive','/dns','/bima','/now','/recent'):
         return HELP
@@ -406,44 +415,62 @@ def main():
     LOGGER.info("Telegram GET polling dimulai: wait=%ss; offset=%s", poll_seconds, offset)
     failures = 0
     fallback_short_poll = poll_seconds == 0
-    while True:
-        try:
-            wait_seconds = 0 if fallback_short_poll else poll_seconds
-            updates = get_updates(token, offset, poll_seconds=wait_seconds,
-                                  http_timeout=max(15, wait_seconds + 10))
-            failures = 0
-            if updates:
-                LOGGER.info("Telegram updates diterima: %d", len(updates))
-            for update in updates:
-                update_id = int(update["update_id"])
-                if update.get("callback_query"):
-                    handle_review_callback(token, update["callback_query"], allowed, db_path)
-                message = update.get("message") or {}
-                chat_id = str((message.get("chat") or {}).get("id", ""))
-                command = message.get("text", "")
-                if chat_id and isinstance(command, str) and command.startswith("/"):
-                    try:
-                        reply = handle_command(command, chat_id, allowed, db_path, update_id,
-                                               str((message.get("from") or {}).get("id", "")))
-                    except (sqlite3.Error, OSError) as error:
-                        LOGGER.error("Database query failed: %s", type(error).__name__)
-                        reply = "Database crawler belum bisa dibaca. Periksa path, izin, dan SQLite."
-                    send_message(token, chat_id, reply)
-                    LOGGER.info("Telegram command handled: %s", command.split()[0].split('@')[0][:30])
-                offset = max(offset, update_id + 1)
-                save_offset(offset_path, offset)
-            if os.environ.get('TELEGRAM_CHECKS_ENABLED') == '1':
-                deliver_checks(token, db_path, allowed)
-            if fallback_short_poll and not updates:
-                time.sleep(3)  # avoid aggressive short polling
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
-            # Never print exception text: urllib exceptions can embed the token URL.
-            failures += 1
-            LOGGER.warning("Telegram poll/send gagal (%s), consecutive=%d", safe_network_error(error), failures)
-            if failures >= 2 and not fallback_short_poll:
-                fallback_short_poll = True
-                LOGGER.warning("Switching to GET short polling (timeout=0) due to repeated errors")
-            time.sleep(min(5 * failures, 15))
+    analyst_service = None
+    if os.environ.get('BIMA_ANALYST_ENABLED') == '1':
+        from telegram_analyst import AnalystService
+        analyst_service = AnalystService(db_path, learning_db=os.environ.get('BIMA_LEARNING_DB'))
+    try:
+        while True:
+            try:
+                wait_seconds = 0 if fallback_short_poll else poll_seconds
+                updates = get_updates(token, offset, poll_seconds=wait_seconds,
+                                      http_timeout=max(15, wait_seconds + 10))
+                failures = 0
+                if updates:
+                    LOGGER.info("Telegram updates diterima: %d", len(updates))
+                for update in updates:
+                    update_id = int(update["update_id"])
+                    if update.get("callback_query"):
+                        handle_review_callback(token, update["callback_query"], allowed, db_path)
+                    message = update.get("message") or {}
+                    chat = message.get("chat") or {}
+                    chat_id = str(chat.get("id", ""))
+                    sender_id = str((message.get("from") or {}).get("id", ""))
+                    command = message.get("text", "")
+                    reply = None
+                    if chat_id and isinstance(command, str) and command.startswith("/"):
+                        try:
+                            reply = handle_command(command, chat_id, allowed, db_path, update_id,
+                                                   sender_id, analyst_service=analyst_service,
+                                                   chat_type=chat.get('type'))
+                        except (sqlite3.Error, OSError) as error:
+                            LOGGER.error("Database query failed: %s", type(error).__name__)
+                            reply = "Database crawler belum bisa dibaca. Periksa path, izin, dan SQLite."
+                        LOGGER.info("Telegram command handled: %s", command.split()[0].split('@')[0][:30])
+                    elif analyst_service is not None and chat_id and isinstance(command, str) and command.strip():
+                        reply = analyst_service.handle(command, chat_id, sender_id, allowed,
+                            update_id=update_id, chat_type=chat.get('type'), plain=True)
+                    if reply is not None:
+                        send_message(token, chat_id, reply)
+                    offset = max(offset, update_id + 1)
+                    save_offset(offset_path, offset)
+                if os.environ.get('TELEGRAM_CHECKS_ENABLED') == '1':
+                    deliver_checks(token, db_path, allowed)
+                if analyst_service is not None:
+                    analyst_service.deliver(lambda chat_id, text: send_message(token, chat_id, text), allowed)
+                if fallback_short_poll and not updates:
+                    time.sleep(3)  # avoid aggressive short polling
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+                # Never print exception text: urllib exceptions can embed the token URL.
+                failures += 1
+                LOGGER.warning("Telegram poll/send gagal (%s), consecutive=%d", safe_network_error(error), failures)
+                if failures >= 2 and not fallback_short_poll:
+                    fallback_short_poll = True
+                    LOGGER.warning("Switching to GET short polling (timeout=0) due to repeated errors")
+                time.sleep(min(5 * failures, 15))
+    finally:
+        if analyst_service is not None:
+            analyst_service.close()
 
 
 if __name__ == "__main__":
