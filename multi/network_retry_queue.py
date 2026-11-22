@@ -10,6 +10,7 @@ from collections import deque
 
 from routine_queue import find_next_pending_job
 from discovery_priority import find_next_discovery_job, find_next_registry_job
+from registry_snapshot_v2 import active_cycle, active_ready, has_table
 
 
 class RetryPacer:
@@ -62,13 +63,28 @@ def find_due_network_retry(conn, now_utc: str, max_attempts: int):
         "AND name='idx_jobs_due_network_retry_v1'"
     ).fetchone() is not None
     index_hint = ' INDEXED BY idx_jobs_due_network_retry_v1' if index_ready else ''
+    # Once Registry snapshot v2 is active, retired Registry retries must not
+    # consume the bounded auto-retry quota. Discovery/Telegram remain separate.
+    scope = ''
+    if active_cycle(conn) is not None:
+        eligible = []
+        if active_ready(conn):
+            eligible.append('EXISTS (SELECT 1 FROM registry_snapshot_queue_v2 s '
+                            'WHERE s.job_id=jobs.id AND s.blocked=0)')
+        if has_table(conn, 'discovery_job_priority'):
+            eligible.append('EXISTS (SELECT 1 FROM discovery_job_priority d '
+                            'WHERE d.job_id=jobs.id)')
+        if has_table(conn, 'telegram_checks'):
+            eligible.append('EXISTS (SELECT 1 FROM telegram_checks t '
+                            'WHERE t.job_id=jobs.id)')
+        scope = ' AND (' + (' OR '.join(eligible) if eligible else '0=1') + ')'
     return conn.execute(
         f"SELECT id,url FROM jobs{index_hint} "
         "WHERE status='retry_http' "
         "AND error_category IN ('dns_error','timeout') "
         "AND attempts>=1 AND attempts<? "
         "AND next_retry_at IS NOT NULL AND next_retry_at<=? "
-        "ORDER BY next_retry_at,id LIMIT 1",
+        + scope + " ORDER BY next_retry_at,id LIMIT 1",
         (max_attempts, now_utc),
     ).fetchone()
 

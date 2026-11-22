@@ -35,6 +35,7 @@ from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
 from routine_queue import find_next_pending_job
 from network_retry_queue import RetryPacer, choose_next_job
 from discovery_priority import DiscoveryPacer
+from registry_snapshot_v2 import cursor_for_job
 from browser_resilience import (
     dismiss_unexpected_dialog, is_likely_antibot_page,
     retry_observation_after_dialog,
@@ -1166,7 +1167,7 @@ def run(args):
                     return False
                 id_, url = row
                 if kind == 'routine':
-                    last_id = id_
+                    last_id = cursor_for_job(conn, id_)
                 conn.execute("UPDATE jobs SET status='http_inflight', attempts=attempts+1, "
                              "updated_at=? WHERE id=?", (utcnow(), id_))
                 if retry_pacer is not None:

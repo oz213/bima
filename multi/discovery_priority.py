@@ -8,6 +8,7 @@ crawler's read helper gracefully handles databases not upgraded yet.
 from __future__ import annotations
 
 from routine_queue import find_next_pending_job
+from registry_snapshot_v2 import active_cycle, find_pending_registry
 
 
 PRIORITY_SCHEMA = """
@@ -45,6 +46,8 @@ def find_next_registry_job(conn, last_id, *, wrap):
     as `routine`, defeating the 4-to-1 fairness guarantee. The cursor remains
     scoped only to Registry jobs and preserves the existing wrap policy.
     """
+    if active_cycle(conn) is not None:
+        return find_pending_registry(conn, last_id, wrap=wrap)
     if not has_priority_table(conn):
         return find_next_pending_job(conn, last_id, wrap=wrap)
     statement = (
