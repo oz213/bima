@@ -51,19 +51,24 @@ class RetryPacer:
 
 
 def find_due_network_retry(conn, now_utc: str, max_attempts: int):
-    """Find one due DNS/timeout retry. Existing (status,id) index is sufficient.
+    """Find earliest eligible due DNS/timeout retry; never resend ambiguous alerts.
 
-    ``attempts`` is incremented when the crawler claims the job. A row with
-    attempts = max_attempts - 1 gets one final chance; exhausting that attempt
-    transitions to inconclusive via the existing plan_http_outcome() logic.
+    Prefer a deadline partial index when installed by crawler startup. Fall back
+    to an unhinted query for test fixtures and databases predating the index.
+    ``attempts`` is incremented by the caller after the claim, not here.
     """
+    index_ready = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_jobs_due_network_retry_v1'"
+    ).fetchone() is not None
+    index_hint = ' INDEXED BY idx_jobs_due_network_retry_v1' if index_ready else ''
     return conn.execute(
-        "SELECT id,url FROM jobs "
+        f"SELECT id,url FROM jobs{index_hint} "
         "WHERE status='retry_http' "
         "AND error_category IN ('dns_error','timeout') "
         "AND attempts>=1 AND attempts<? "
         "AND next_retry_at IS NOT NULL AND next_retry_at<=? "
-        "ORDER BY id LIMIT 1",
+        "ORDER BY next_retry_at,id LIMIT 1",
         (max_attempts, now_utc),
     ).fetchone()
 

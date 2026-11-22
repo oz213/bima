@@ -866,6 +866,15 @@ def connect_db(db_filename):
                          ('dns_host','TEXT')):
         if col not in existing:
             conn.execute(f'ALTER TABLE jobs ADD COLUMN {col} {sqltype}')
+    # Index only deferred DNS/timeouts, not the 1.5M-row routine URL queue.
+    # Do this AFTER the additive column migration for older installations.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_due_network_retry_v1 "
+        "ON jobs(next_retry_at,id) "
+        "WHERE status='retry_http' "
+        "AND error_category IN ('dns_error','timeout') "
+        "AND next_retry_at IS NOT NULL"
+    )
     journal_mode = os.environ.get('BIMA_SQLITE_JOURNAL_MODE', 'WAL').upper()
     if journal_mode not in ('WAL', 'DELETE'):
         conn.close()
