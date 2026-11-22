@@ -208,7 +208,7 @@ HELP = (
 
 
 def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=None,
-                   *, analyst_service=None, chat_type=None):
+                   *, analyst_service=None, investigation_service=None, chat_type=None):
     parts = text.strip().split()
     command = (parts[0] if parts else '').split('@')[0].lower()
     if command in ('/id', '/start'):
@@ -220,6 +220,11 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
             return 'Fitur analisis belum diaktifkan oleh administrator.'
         return analyst_service.handle(text, chat_id, sender_id, allowed,
                                       update_id=update_id, chat_type=chat_type)
+    if command == '/investigasi':
+        if os.environ.get('BIMA_INVESTIGATION_ENABLED') != '1' or investigation_service is None:
+            return 'Fitur investigasi belum diaktifkan oleh administrator.'
+        return investigation_service.handle(text, chat_id, sender_id, allowed,
+                                            chat_type=chat_type)
     if command in ('/review', '/bukti', '/pola'):
         from telegram_review import handle
         return handle(text, chat_id, sender_id, allowed, db_path)
@@ -235,10 +240,13 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
         check_id = request_check(db_path, url, chat_id, update_id)
         return f'Permintaan #{check_id} diterima. Hasil akan dikirim ke chat ini.'
     if command in ('/help', ''):
+        help_text = HELP
         if os.environ.get('BIMA_ANALYST_ENABLED') == '1' and analyst_service is not None:
             from telegram_analyst import HELP as ANALYST_HELP
-            return HELP + ANALYST_HELP
-        return HELP
+            help_text += ANALYST_HELP
+        if investigation_service is not None:
+            help_text += '\n/investigasi <domain.id|#job> - HTTP on-demand reviewer pribadi'
+        return help_text
     if command not in ('/status','/inconclusive','/dns','/bima','/now','/recent'):
         return HELP
     limit = 5
@@ -419,6 +427,10 @@ def main():
     if os.environ.get('BIMA_ANALYST_ENABLED') == '1':
         from telegram_analyst import AnalystService
         analyst_service = AnalystService(db_path, learning_db=os.environ.get('BIMA_LEARNING_DB'))
+    investigation_service = None
+    if os.environ.get('BIMA_INVESTIGATION_ENABLED') == '1':
+        from telegram_investigation import InvestigationService
+        investigation_service = InvestigationService(db_path)
     try:
         while True:
             try:
@@ -442,6 +454,7 @@ def main():
                         try:
                             reply = handle_command(command, chat_id, allowed, db_path, update_id,
                                                    sender_id, analyst_service=analyst_service,
+                                                   investigation_service=investigation_service,
                                                    chat_type=chat.get('type'))
                         except (sqlite3.Error, OSError) as error:
                             LOGGER.error("Database query failed: %s", type(error).__name__)
@@ -458,6 +471,9 @@ def main():
                     deliver_checks(token, db_path, allowed)
                 if analyst_service is not None:
                     analyst_service.deliver(lambda chat_id, text: send_message(token, chat_id, text), allowed)
+                if investigation_service is not None:
+                    investigation_service.deliver(
+                        lambda chat_id, text: send_message(token, chat_id, text), allowed)
                 if fallback_short_poll and not updates:
                     time.sleep(3)  # avoid aggressive short polling
             except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
@@ -471,6 +487,8 @@ def main():
     finally:
         if analyst_service is not None:
             analyst_service.close()
+        if investigation_service is not None:
+            investigation_service.close()
 
 
 if __name__ == "__main__":
