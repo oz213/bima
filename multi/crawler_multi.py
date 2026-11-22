@@ -830,6 +830,9 @@ def connect_db(db_filename):
     Path(db_filename).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_filename, timeout=30)
     conn.executescript(SCHEMA + CHECK_SCHEMA)
+    if os.environ.get('BIMA_PREALERT_ENABLED') == '1':
+        from selective_prealert import PREALERT_SCHEMA
+        conn.executescript(PREALERT_SCHEMA)
     if 'progress_sent' not in {r[1] for r in conn.execute('PRAGMA table_info(telegram_checks)')}:
         conn.execute('ALTER TABLE telegram_checks ADD COLUMN progress_sent INTEGER NOT NULL DEFAULT 0')
     # Safe additive migration for existing v1.2.1 databases.
@@ -985,7 +988,9 @@ def print_stats(conn, elapsed, processed):
     counts = dict(conn.execute('SELECT status, COUNT(*) FROM jobs GROUP BY status').fetchall())
     attempted = sum(counts.get(x, 0) for x in (
         'complete', 'alerted', 'inconclusive', 'review_required', 'dry_run_alert',
-        'pending_alert', 'retry_http', 'browser_queued'))
+        'pending_alert', 'retry_http', 'browser_queued', 'awaiting_review',
+        'review_approved', 'review_rejected', 'review_needs_evidence',
+        'prealert_send_unknown', 'prealert_error'))
     log(f'Run finished; http attempts this run={processed}; elapsed={elapsed:.1f}s; '
         f'throughput={processed/max(elapsed,0.01)*60:.2f} URL/minute')
     log(f'Stored states: {json.dumps(counts, ensure_ascii=False)}')
@@ -1076,7 +1081,23 @@ def run(args):
             updates = build_browser_result_updates(result)
             set_status(conn, id_, state, **updates)
             if state == 'pending_alert':
-                # PNG bytes move only through the bounded in-memory results queue.
+                # Only selected candidates wait for Telegram; non-selected ones
+                # keep the existing engine.send_alert() transport unchanged.
+                if os.environ.get('BIMA_PREALERT_ENABLED') == '1' and not args.dry_run:
+                    try:
+                        from selective_prealert import enqueue_candidate
+                        if enqueue_candidate(conn, id_, result['url'], result['confidence'],
+                                             result.get('screenshot_png')):
+                            log(f'Pre-alert selected for private review: job_id={id_}')
+                            result.pop('screenshot_png', None)
+                            return
+                    except Exception as exc:
+                        # Ambiguous queue state: NEVER bypass reviewer approval.
+                        log(f'ERROR: pre-alert queue failed for job_id={id_}: {type(exc).__name__}')
+                        set_status(conn, id_, 'prealert_error', reason='prealert_queue_check_required')
+                        result.pop('screenshot_png', None)
+                        return
+                # Original direct BIMA sender for EVERY non-selected candidate.
                 send_pending_alert(engine, conn, id_, result['url'],
                                    result['confidence'], result.get('screenshot_png'), args.dry_run)
                 result.pop('screenshot_png', None)

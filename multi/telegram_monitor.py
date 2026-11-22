@@ -135,6 +135,12 @@ def status_label(status, risk=None, reason=None):
     labels = {
         'alerted': 'JUDOL -> BIMA terkirim',
         'pending_alert': 'JUDOL -> BIMA tertunda',
+        'awaiting_review': 'Kandidat judol - menunggu verifikasi Telegram',
+        'review_approved': 'Judol terkonfirmasi - menunggu kirim BIMA',
+        'review_rejected': 'Bukan judol menurut reviewer',
+        'review_needs_evidence': 'Bukti belum cukup - perlu investigasi',
+        'prealert_send_unknown': 'Alert BIMA tidak pasti - jangan retry otomatis',
+        'prealert_error': 'Antrean pre-alert perlu pemeriksaan manual',
         'dry_run_alert': 'Judol (dry-run)',
         'complete': 'Selesai diperiksa',
         'inconclusive': 'Belum dapat disimpulkan',
@@ -203,6 +209,7 @@ HELP = (
     "/id - tampilkan chat ID untuk otorisasi\n"
     "/pola - kasus dengan bukti berulang lintas situs\n"
     "/review - verifikasi situs (reviewer pribadi)\n"
+    "/antrian - status kandidat Telegram pre-alert\n"
     "/help - daftar perintah"
 )
 
@@ -225,6 +232,11 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
             return 'Fitur investigasi belum diaktifkan oleh administrator.'
         return investigation_service.handle(text, chat_id, sender_id, allowed,
                                             chat_type=chat_type)
+    if command == '/antrian':
+        if os.environ.get('BIMA_PREALERT_ENABLED') != '1':
+            return 'BIMA selective pre-alert belum diaktifkan.'
+        from selective_prealert import pending_summary
+        return pending_summary(db_path, chat_id, sender_id, allowed)
     if command in ('/review', '/bukti', '/pola'):
         from telegram_review import handle
         return handle(text, chat_id, sender_id, allowed, db_path)
@@ -334,6 +346,12 @@ def handle_review_callback(token, query, allowed, db_path):
     if chat.get("type") == "private" and data.startswith("br:"):
         chat_id = str(chat["id"])
         reply = handle(data, chat_id, sender, allowed, db_path, callback=True)
+        send_message(token, chat_id, reply)
+    elif (chat.get("type") == "private" and data.startswith("pa:") and
+          os.environ.get('BIMA_PREALERT_ENABLED') == '1'):
+        from selective_prealert import decide
+        chat_id = str(chat["id"])
+        reply = decide(db_path, data, chat_id, sender, allowed, chat.get('type'))
         send_message(token, chat_id, reply)
 
 
@@ -474,6 +492,17 @@ def main():
                 if investigation_service is not None:
                     investigation_service.deliver(
                         lambda chat_id, text: send_message(token, chat_id, text), allowed)
+                if os.environ.get('BIMA_PREALERT_ENABLED') == '1':
+                    from selective_prealert import deliver_one, dispatch_one
+                    deliver_one(token, db_path, allowed)
+                    outcome = dispatch_one(db_path)
+                    if outcome is not None:
+                        reviewer = os.environ.get('BIMA_PREALERT_REVIEWER_CHAT_ID', '').strip()
+                        if reviewer in allowed:
+                            result = ('terkirim ke sistem BIMA' if outcome['ok'] else
+                                      'BELUM terkonfirmasi; cek BIMA sebelum retry manual')
+                            send_message(token, reviewer,
+                                         f"Pre-Alert #{outcome['id']}: {result}.")
                 if fallback_short_poll and not updates:
                     time.sleep(3)  # avoid aggressive short polling
             except (HTTPError, URLError, TimeoutError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
