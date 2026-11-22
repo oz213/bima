@@ -35,6 +35,10 @@ from telegram_checks import CHECK_SCHEMA, normalize_input_url, save_results
 from routine_queue import find_next_pending_job
 from network_retry_queue import RetryPacer, choose_next_job
 from discovery_priority import DiscoveryPacer
+from browser_resilience import (
+    dismiss_unexpected_dialog, is_likely_antibot_page,
+    retry_observation_after_dialog,
+)
 
 _HTTP_LOCAL = threading.local()
 _INFERENCE_LOCK = threading.Lock()
@@ -190,6 +194,10 @@ def load_engine(filename, args):
             '[WARN]' in message or '[ERROR]' in message) else None
     log(f'IndoBERT loaded ONCE from {engine.INDO_BERT_MODEL_PATH}; '
         f'batch={args.bert_batch_size}; torch_threads={threads}')
+    # The original classifier also checks this function internally. Replace
+    # it once BEFORE workers start, so all HTTP/browser checks agree.
+    # The IndoBERT model, thresholds and gambling rules are unchanged.
+    engine.is_captcha_or_antibot_page = is_likely_antibot_page
     return engine
 
 
@@ -334,7 +342,7 @@ def classify_shared(engine, url, current_url, text, title, source='requests', pa
     # The original process_url() checks minimum text lengths BEFORE invoking
     # classify_text_content(): 50 characters for requests, 30 for Selenium.
     minimum = 50 if source == 'requests' else 30
-    if engine.is_captcha_or_antibot_page(text, title):
+    if is_likely_antibot_page(text, title):
         return {'status': 'blocked_or_captcha', 'reason': 'captcha_or_antibot',
                 'ml_conf': 0.0, 'bert_used': False, 'bert_ms': 0}
     if len(text or '') < minimum:
@@ -697,10 +705,12 @@ def browser_loop(engine, tasks, results, args):
                 validate_public_target(active_url)
                 opened_url = engine.selenium_get_with_scheme_fallback(driver, active_url)
                 try:
-                    engine.wait_page_loaded(driver, timeout=15)
+                    retry_observation_after_dialog(
+                        driver, lambda: engine.wait_page_loaded(driver, timeout=15))
                 except Exception:
                     engine.stop_page_loading(driver)
-                final_url = driver.current_url or opened_url or active_url
+                final_url = (retry_observation_after_dialog(
+                    driver, lambda: driver.current_url) or opened_url or active_url)
                 validate_public_target(final_url)
                 record['final_url'] = final_url
 
@@ -732,17 +742,26 @@ def browser_loop(engine, tasks, results, args):
 
                 # Original browser path: get_page_text() and driver.title,
                 # not an additional independent hidden-link classifier.
-                text = engine.get_page_text(driver)
-                title = getattr(driver, 'title', '') or ''
-                if engine.is_captcha_or_antibot_page(text, title):
-                    finished = engine.wait_until_antibot_finished(
-                        driver, max_wait=engine.ANTIBOT_MAX_WAIT_SECONDS)
-                    final_url = driver.current_url or final_url
+                text = retry_observation_after_dialog(
+                    driver, lambda: engine.get_page_text(driver))
+                title = retry_observation_after_dialog(
+                    driver, lambda: getattr(driver, 'title', '')) or ''
+                if is_likely_antibot_page(text, title):
+                    try:
+                        engine.wait_until_antibot_finished(
+                            driver, max_wait=engine.ANTIBOT_MAX_WAIT_SECONDS)
+                    except Exception as exc:
+                        if not dismiss_unexpected_dialog(driver, exc):
+                            raise
+                    final_url = (retry_observation_after_dialog(
+                        driver, lambda: driver.current_url) or final_url)
                     validate_public_target(final_url)
                     record['final_url'] = final_url
-                    text = engine.get_page_text(driver)
-                    title = getattr(driver, 'title', '') or ''
-                    if not finished or engine.is_captcha_or_antibot_page(text, title):
+                    text = retry_observation_after_dialog(
+                        driver, lambda: engine.get_page_text(driver))
+                    title = retry_observation_after_dialog(
+                        driver, lambda: getattr(driver, 'title', '')) or ''
+                    if is_likely_antibot_page(text, title):
                         record.update(status='inconclusive', reason='captcha_or_antibot')
                         continue
                 if len(text or '') < 30:
@@ -750,7 +769,8 @@ def browser_loop(engine, tasks, results, args):
                     continue
                 browser_cls = classify_shared(
                     engine, input_url, final_url, text, title, source='selenium',
-                    page_html=lambda: driver.page_source)
+                    page_html=lambda: retry_observation_after_dialog(
+                        driver, lambda: driver.page_source))
                 # The flat top-level decision stays queryable as before.
                 # Store the HTTP intermediate result only as audit metadata.
                 capture_review_excerpt(browser_cls, text)
@@ -776,7 +796,10 @@ def browser_loop(engine, tasks, results, args):
                 else:
                     record['status'] = 'inconclusive'
             except Exception as exc:
-                record.update(status='inconclusive', reason='browser_error', error=str(exc)[:500])
+                # Never store untrusted JavaScript alert text or remote URLs
+                # from a WebDriver exception in crawler evidence metadata.
+                record.update(status='inconclusive', reason='browser_error',
+                              error=type(exc).__name__)
                 close_browser(driver, profile)
                 driver, profile = None, None
             finally:
