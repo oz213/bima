@@ -20,6 +20,7 @@ import re
 import secrets
 import stat
 import sqlite3
+import time
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -32,7 +33,8 @@ MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_PENDING_BYTES = 512 * 1024 * 1024
 BUCKET_LIMITS = {'strong': 6, 'disagreement': 3, 'sample': 1}
 FILE_NAME = re.compile(r'\A[0-9a-f]{32}\.png\Z')
-CALLBACK = re.compile(r'\Apa:([1-9][0-9]{0,17}):(yes|no|defer)\Z')
+CALLBACK = re.compile(r'\Apa:([1-9][0-9]{0,17})(?::([0-9a-f]{12}))?:(yes|no|defer)\Z')
+CASE_ID = re.compile(r'\A#?([1-9][0-9]{0,17})\Z')
 
 PREALERT_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS bima_prealerts (
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS bima_prealerts (
  reviewer_id TEXT,
  feedback_label TEXT,
  reviewed_at TEXT,
+ review_nonce TEXT,
  bima_attempted_at TEXT,
  bima_result_at TEXT,
  created_at TEXT NOT NULL,
@@ -74,6 +77,20 @@ CREATE TABLE IF NOT EXISTS bima_prealert_events (
 );
 '''
 
+# Audit is separated from the human decision log; it never stores response
+# bodies, tokens, screenshots, headers, or the BIMA API key.
+DISPATCH_AUDIT_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS bima_prealert_dispatch_audit (
+ prealert_id INTEGER PRIMARY KEY REFERENCES bima_prealerts(id),
+ attempted_at TEXT NOT NULL,
+ completed_at TEXT,
+ http_status INTEGER,
+ elapsed_ms INTEGER,
+ result TEXT NOT NULL CHECK(result IN ('sending','sent','send_unknown')),
+ error_kind TEXT
+);
+'''
+
 
 def utc_now():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -86,6 +103,21 @@ def db_connect(path):
     exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bima_prealerts'").fetchone()
     if not exists:
         conn.executescript(PREALERT_SCHEMA)
+    # Additive migration for production DBs initialized before this patch.
+    # Never change existing decisions, screenshots or previous send_unknown cases.
+    columns = {column[1] for column in conn.execute('PRAGMA table_info(bima_prealerts)')}
+    if 'review_nonce' not in columns:
+        try:
+            conn.execute('ALTER TABLE bima_prealerts ADD COLUMN review_nonce TEXT')
+        except sqlite3.OperationalError:
+            # A second active process may have applied the same ALTER.
+            if 'review_nonce' not in {
+                    column[1] for column in conn.execute('PRAGMA table_info(bima_prealerts)')}:
+                conn.close()
+                raise
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='bima_prealert_dispatch_audit'").fetchone():
+        conn.executescript(DISPATCH_AUDIT_SCHEMA)
     return conn
 
 
@@ -312,13 +344,13 @@ def deliver_one(token, db_path, allowed, *, uploader=None):
     retry_before = (now - timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
     with closing(db_connect(db_path)) as conn:
         row = conn.execute("SELECT id,job_id,url,final_url,bucket,confidence,evidence_sha256,"
-                           "image_filename,classifier_json FROM bima_prealerts "
+                           "image_filename,classifier_json,review_nonce FROM bima_prealerts "
                            "WHERE status='pending_telegram' AND "
                            "(notify_attempt_at IS NULL OR notify_attempt_at<=?) "
                            "ORDER BY id LIMIT 1", (retry_before,)).fetchone()
         if not row:
             return False
-        cid, job_id, url, final_url, bucket, confidence, digest, filename, raw = row
+        cid, job_id, url, final_url, bucket, confidence, digest, filename, raw, nonce = row
         # Persist a five-minute retry delay BEFORE calling a remote service.
         with conn:
             conn.execute('UPDATE bima_prealerts SET notify_attempt_at=?,notify_attempts=notify_attempts+1 '
@@ -340,10 +372,14 @@ def deliver_one(token, db_path, allowed, *, uploader=None):
                    f'IndoBERT: {indobert} | Classic ML: {ml}\n'
                    f'Alasan: {reason}\n'
                    'Screenshot asli crawler. Verifikasi sebelum alert ke BIMA.')
+        if nonce:
+            caption += ('\nTINJAU ULANG: screenshot awal, bukan pengambilan baru. '
+                        'Periksa juga hasil /investigasi sebelum memutuskan.')
+        prefix = f'pa:{cid}:{nonce}' if nonce else f'pa:{cid}'
         reply = {'inline_keyboard': [
-            [{'text': 'Judol - kirim BIMA', 'callback_data': f'pa:{cid}:yes'}],
-            [{'text': 'Bukan Judol', 'callback_data': f'pa:{cid}:no'},
-             {'text': 'Bukti kurang', 'callback_data': f'pa:{cid}:defer'}]]}
+            [{'text': 'Judol - kirim BIMA', 'callback_data': f'{prefix}:yes'}],
+            [{'text': 'Bukan Judol', 'callback_data': f'{prefix}:no'},
+             {'text': 'Bukti kurang', 'callback_data': f'{prefix}:defer'}]]}
         result = upload(token, chat, png, caption, reply)
         document = result.get('document') or {}
         if not document.get('file_id') or not result.get('message_id'):
@@ -370,7 +406,7 @@ def decide(db_path, callback_data, chat, sender, allowed, chat_type):
     if (chat_type != 'private' or chat != _reviewer_chat(allowed)
             or not authorized(chat, sender, allowed)):
         return 'Hanya reviewer terdaftar di chat pribadi yang dapat memutuskan.'
-    cid, action = int(match[1]), match[2]
+    cid, nonce, action = int(match[1]), match[2], match[3]
     status = {'yes': 'approved', 'no': 'rejected', 'defer': 'needs_review'}[action]
     label = {'yes': 'gambling', 'no': 'non_gambling', 'defer': 'inconclusive'}[action]
     job_status = {'yes': 'review_approved', 'no': 'review_rejected',
@@ -379,12 +415,17 @@ def decide(db_path, callback_data, chat, sender, allowed, chat_type):
     with closing(db_connect(db_path)) as conn:
         conn.execute('BEGIN IMMEDIATE')
         try:
-            row = conn.execute('SELECT job_id,image_filename,status FROM bima_prealerts WHERE id=?',
+            row = conn.execute('SELECT job_id,image_filename,status,review_nonce '
+                               'FROM bima_prealerts WHERE id=?',
                                (cid,)).fetchone()
             if not row:
                 conn.rollback()
                 return 'Kasus tidak ditemukan.'
-            job, filename, previous = row
+            job, filename, previous, active_nonce = row
+            if active_nonce != nonce:
+                conn.rollback()
+                return ('Tombol verifikasi lama/tidak sesuai. '
+                        'Gunakan pesan Telegram verifikasi terbaru.')
             if previous != 'awaiting_review':
                 conn.rollback()
                 return f'Kasus #{cid} sudah berstatus {previous}; keputusan tidak diulang.'
@@ -407,6 +448,66 @@ def decide(db_path, callback_data, chat, sender, allowed, chat_type):
     return {'yes':f'Kasus #{cid} disetujui. Alert BIMA masuk antrean pengiriman.',
             'no':f'Kasus #{cid} ditolak. Tidak ada alert BIMA. Label disimpan.',
             'defer':f'Kasus #{cid} ditunda. Tidak ada alert BIMA sampai ditinjau ulang.'}[action]
+
+
+def reopen_review(db_path, case_id, chat, sender, allowed, chat_type):
+    """Reviewer-only requeue of a deferred case; never posts to BIMA.
+
+    Uses the original verified screenshot. A new nonce invalidates all old
+    Telegram buttons before the replacement screenshot is delivered.
+    """
+    if (chat_type != 'private' or chat != _reviewer_chat(allowed)
+            or not authorized(chat, sender, allowed)):
+        return 'Hanya reviewer terdaftar di chat pribadi yang dapat meninjau ulang.'
+    parsed = CASE_ID.fullmatch(str(case_id or ''))
+    if not parsed:
+        return 'Gunakan /tinjauulang #ID_KASUS (contoh /tinjauulang #5).'
+    cid = int(parsed[1])
+    with closing(db_connect(db_path)) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            row = conn.execute(
+                'SELECT job_id,image_filename,evidence_sha256,status '
+                'FROM bima_prealerts WHERE id=?', (cid,)).fetchone()
+            if not row:
+                conn.rollback()
+                return 'Kasus tidak ditemukan.'
+            job_id, filename, digest, previous = row
+            if previous != 'needs_review':
+                conn.rollback()
+                return (f'Kasus #{cid} berstatus {previous}; '
+                        'hanya needs_review dapat ditinjau ulang.')
+            try:
+                _read_image(db_path, filename, digest)
+            except (OSError, ValueError):
+                conn.rollback()
+                return ('Bukti screenshot hilang/berubah. '
+                        'Tinjau manual; tidak ada alert BIMA dikirim.')
+            nonce = secrets.token_hex(6)
+            now = utc_now()
+            updated = conn.execute(
+                "UPDATE jobs SET status='awaiting_review', "
+                "reason='telegram_prealert_manual_rereview',updated_at=? "
+                "WHERE id=? AND status='review_needs_evidence'", (now, job_id))
+            if updated.rowcount != 1:
+                conn.rollback()
+                return 'Status job berubah; pemeriksaan manual diperlukan.'
+            conn.execute(
+                "UPDATE bima_prealerts SET status='pending_telegram',review_nonce=?, "
+                "notify_attempt_at=NULL,notify_attempts=0,telegram_chat_id=NULL, "
+                "telegram_message_id=NULL,telegram_file_id=NULL, "
+                "feedback_label=NULL,reviewer_id=NULL,reviewed_at=NULL,updated_at=? "
+                "WHERE id=? AND status='needs_review'", (nonce, now, cid))
+            conn.execute(
+                'INSERT INTO bima_prealert_events(prealert_id,event_type,actor,created_at) '
+                'VALUES(?,?,?,?)', (cid, 'review_reopened_manual', 'telegram:' + sender, now))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return (f'Kasus #{cid} dimasukkan kembali ke antrean verifikasi. '
+            'Screenshot awal akan dikirim ulang dengan tombol baru. '
+            'Tidak ada alert BIMA otomatis.')
 
 
 def _sender_config(config_path=None):
@@ -435,8 +536,8 @@ def _payload(url, png, confidence, cfg):
             'screenshots':['data:image/png;base64,'+base64.b64encode(png).decode('ascii')]}
 
 
-def _post_bima(payload, cfg):
-    """Same wire contract as crawler_url.send_alert(): ONE POST, no redirects/retry."""
+def _post_bima(payload, cfg, *, audit=None):
+    """Same BIMA wire contract: exactly one POST, no redirects/retry."""
     import requests
     with requests.Session() as session:
         response = session.post(
@@ -447,6 +548,10 @@ def _post_bima(payload, cfg):
             timeout=(float(cfg.get('ALERT_CONNECT_TIMEOUT',5)),
                      float(cfg.get('ALERT_READ_TIMEOUT',30))))
         try:
+            # No response headers/body or URL are persisted: they can contain
+            # credentials or untrusted strings. Only bounded HTTP status.
+            if audit is not None:
+                audit['http_status'] = int(response.status_code)
             return response.status_code == 200
         finally:
             response.close()
@@ -462,7 +567,8 @@ def dispatch_one(db_path, *, sender=None, config_path=None):
         return None
     with closing(db_connect(db_path)) as conn:
         row = conn.execute("SELECT id,job_id,url,confidence,image_filename,evidence_sha256 "
-                           "FROM bima_prealerts WHERE status='approved' ORDER BY id LIMIT 1").fetchone()
+                           "FROM bima_prealerts WHERE status='approved' AND bima_attempted_at IS NULL "
+                           "ORDER BY id LIMIT 1").fetchone()
         if not row:
             return None
         cid, job_id, url, confidence, filename, digest = row
@@ -473,26 +579,46 @@ def dispatch_one(db_path, *, sender=None, config_path=None):
             payload = _payload(url, png, confidence, cfg)
         except Exception as exc:
             LOGGER.warning('approved case cannot be dispatched: %s', type(exc).__name__)
-            return False
+            return None
         conn.execute('BEGIN IMMEDIATE')
         try:
             result = conn.execute('UPDATE bima_prealerts SET status=?,bima_attempted_at=?,updated_at=? '
-                                  "WHERE id=? AND status='approved'",
+                                  "WHERE id=? AND status='approved' AND bima_attempted_at IS NULL",
                                   ('sending',utc_now(),utc_now(),cid))
             if result.rowcount != 1:
                 conn.rollback()
-                return False
+                return None
             conn.execute('INSERT INTO bima_prealert_events(prealert_id,event_type,actor,created_at) '
                          'VALUES(?,?,?,?)', (cid,'bima_send_started','dispatcher',utc_now()))
+            # Unique per case; even an accidental manual status reset cannot
+            # silently create another POST for the same pre-alert.
+            conn.execute('INSERT INTO bima_prealert_dispatch_audit '
+                         '(prealert_id,attempted_at,result) VALUES(?,?,?)',
+                         (cid,utc_now(),'sending'))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+    observed = {}
+    started = time.monotonic()
+    failure = None
     try:
-        ok = (sender or _post_bima)(payload, cfg)
+        if sender is None:
+            ok = _post_bima(payload, cfg, audit=observed)
+        else:
+            # Existing tests/specialized callers retain their bool contract.
+            ok = sender(payload, cfg)
+        if not isinstance(ok, bool):
+            failure = 'invalid_sender_result'
+            ok = False
     except Exception as exc:
-        LOGGER.warning('BIMA alert delivery not confirmed: %s', type(exc).__name__)
+        # Type only: exception messages may embed the endpoint or API key.
+        failure = type(exc).__name__[:64]
         ok = False
+    elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+    http_status = observed.get('http_status')
+    if not ok and failure is None:
+        failure = 'http_non_200' if http_status is not None else 'unconfirmed_sender'
     with closing(db_connect(db_path)) as conn, conn:
         next_status = 'sent' if ok else 'send_unknown'
         job_status = 'alerted' if ok else 'prealert_send_unknown'
@@ -501,9 +627,16 @@ def dispatch_one(db_path, *, sender=None, config_path=None):
         conn.execute('UPDATE jobs SET status=?,reason=?,updated_at=? WHERE id=? AND status=?',
                      (job_status, 'bima_alert_sent_after_review' if ok else
                       'bima_prealert_send_unknown_manual_reconcile', utc_now(),job_id,'review_approved'))
+        conn.execute('UPDATE bima_prealert_dispatch_audit SET '
+                     'completed_at=?,http_status=?,elapsed_ms=?,result=?,error_kind=? '
+                     "WHERE prealert_id=? AND result='sending'",
+                     (utc_now(), http_status, elapsed_ms, next_status, failure, cid))
         conn.execute('INSERT INTO bima_prealert_events(prealert_id,event_type,actor,created_at) '
                      'VALUES(?,?,?,?)', (cid,'bima_sent' if ok else 'bima_send_unknown',
                                          'dispatcher',utc_now()))
+    LOGGER.info('prealert dispatch case=%d job=%d http_status=%s duration_ms=%d result=%s error=%s',
+                cid, job_id, http_status if http_status is not None else '-',
+                elapsed_ms, next_status, failure or '-')
     if ok:
         _delete_image(db_path, filename)
     return {'id':cid, 'ok':bool(ok)}

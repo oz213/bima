@@ -210,6 +210,7 @@ HELP = (
     "/pola - kasus dengan bukti berulang lintas situs\n"
     "/review - verifikasi situs (reviewer pribadi)\n"
     "/antrian - status kandidat Telegram pre-alert\n"
+    "/tinjauulang #kasus - ulang verifikasi setelah investigasi\n"
     "/help - daftar perintah"
 )
 
@@ -237,6 +238,12 @@ def handle_command(text, chat_id, allowed, db_path, update_id=None, sender_id=No
             return 'BIMA selective pre-alert belum diaktifkan.'
         from selective_prealert import pending_summary
         return pending_summary(db_path, chat_id, sender_id, allowed)
+    if command == '/tinjauulang':
+        if os.environ.get('BIMA_PREALERT_ENABLED') != '1':
+            return 'BIMA selective pre-alert belum diaktifkan.'
+        from selective_prealert import reopen_review
+        case_id = parts[1] if len(parts) == 2 else None
+        return reopen_review(db_path, case_id, chat_id, sender_id, allowed, chat_type)
     if command in ('/review', '/bukti', '/pola'):
         from telegram_review import handle
         return handle(text, chat_id, sender_id, allowed, db_path)
