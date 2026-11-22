@@ -1259,6 +1259,8 @@ def run(args):
 
 
 def main():
+    from bima_private_config import apply_private_config
+    apply_private_config('crawler')
     args = arg_parser().parse_args()
     def stop_handler(signum, frame):
         _STOP.set()

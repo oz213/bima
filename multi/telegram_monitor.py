@@ -418,6 +418,8 @@ def save_offset(path, n):
 
 
 def main():
+    from bima_private_config import apply_private_config
+    apply_private_config('telegram')
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:

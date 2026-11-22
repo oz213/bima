@@ -4,6 +4,21 @@ set -eu
 umask 077
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 cd "$ROOT"
+# Load the sole private configuration before any API call, at most once.
+if [ -r "$HOME/.config/bima/bima.json" ] && [ "${BIMA_PRIVATE_LOADED:-0}" != 1 ]; then
+  exec "$ROOT/venv/bin/python3" -B "$ROOT/multi/bima_private_config.py" --role discovery -- "$0" "$@"
+fi
+# Cron still runs daily; providers and import only execute every N UTC days.
+INTERVAL=${BIMA_DISCOVERY_INTERVAL_DAYS:-1}
+case "$INTERVAL" in 1|2) ;; *) echo 'Invalid BIMA discovery interval' >&2; exit 1 ;; esac
+if [ "$INTERVAL" = 2 ]; then
+  ANCHOR=${BIMA_DISCOVERY_ANCHOR_UTC:-2026-11-22}
+  START=$(date -u -d "$ANCHOR 00:00:00 UTC" +%s) || exit 1
+  NOW=$(date -u +%s)
+  DAYS=$(( (NOW - START) / 86400 ))
+  [ "$DAYS" -ge 0 ] || exit 0
+  [ $(( DAYS % 2 )) -eq 0 ] || exit 0
+fi
 LOG_DIR=${BIMA_DISCOVERY_LOG_DIR:-"$HOME/bima-logs"}
 mkdir -p -- "$LOG_DIR"
 LOCK="$LOG_DIR/multi-source.lock"
@@ -15,25 +30,29 @@ exec 9>"$LOCK"
 PROVIDERS=google,urlscan
 BRAVE_DAILY_REQUESTS=1
 if [ "${BIMA_ENABLE_BRAVE_DAILY:-0}" = 1 ]; then
-  SECRET_FILE="$HOME/.config/bima/brave-api-key"
-  if [ ! -f "$SECRET_FILE" ] || [ -L "$SECRET_FILE" ] || [ ! -r "$SECRET_FILE" ]; then
-    printf '%s\n' 'BIMA: Brave enabled but private API key file is missing/unreadable' >&2
-    exit 1
+  # A migrated installation receives this in-memory from the private JSON.
+  # Keep the legacy key-file fallback until the migration has completed.
+  if [ -z "${BRAVE_SEARCH_API_KEY:-}" ]; then
+    SECRET_FILE="$HOME/.config/bima/brave-api-key"
+    if [ ! -f "$SECRET_FILE" ] || [ -L "$SECRET_FILE" ] || [ ! -r "$SECRET_FILE" ]; then
+      printf '%s\n' 'BIMA: Brave enabled but private API key is missing' >&2
+      exit 1
+    fi
+    FILE_MODE=$(stat -c '%a' "$SECRET_FILE" 2>/dev/null || stat -f '%Lp' "$SECRET_FILE" 2>/dev/null || true)
+    if [ "$FILE_MODE" != 600 ]; then
+      printf '%s\n' 'BIMA: Brave API key file must have mode 0600' >&2
+      exit 1
+    fi
+    IFS= read -r BRAVE_SEARCH_API_KEY < "$SECRET_FILE" || true
   fi
-  FILE_MODE=$(stat -c '%a' "$SECRET_FILE" 2>/dev/null || stat -f '%Lp' "$SECRET_FILE" 2>/dev/null || true)
-  if [ "$FILE_MODE" != 600 ]; then
-    printf '%s\n' 'BIMA: Brave API key file must have mode 0600' >&2
-    exit 1
-  fi
-  BRAVE_SEARCH_API_KEY=
-  IFS= read -r BRAVE_SEARCH_API_KEY < "$SECRET_FILE" || true
-  if [ -z "$BRAVE_SEARCH_API_KEY" ]; then
-    printf '%s\n' 'BIMA: Brave API key file is empty' >&2
+  if [ -z "${BRAVE_SEARCH_API_KEY:-}" ]; then
+    printf '%s\n' 'BIMA: Brave API key is empty' >&2
     exit 1
   fi
   export BRAVE_SEARCH_API_KEY
   PROVIDERS=google,brave,urlscan
-  BRAVE_DAILY_REQUESTS=14
+  BRAVE_DAILY_REQUESTS=${BIMA_BRAVE_REQUESTS_PER_RUN:-1}
+  case "$BRAVE_DAILY_REQUESTS" in 1|2|3|4|5|6|7|8|9|10|11|12|13|14) ;; *) echo 'Invalid Brave request limit' >&2; exit 1 ;; esac
 fi
 
 # Enabled only by the explicit operator-controlled cron environment variable.
@@ -49,7 +68,7 @@ run_discovery() {
   PYTHONPATH="$ROOT/multi:$ROOT" \
     "$ROOT/venv/bin/python3" -B "$ROOT/multi/multi_source_discovery.py" \
     --domains "$ROOT/domains.json" \
-    --config "$ROOT/config.json" \
+    --config "${BIMA_CONFIG_FILE:-$ROOT/config.json}" \
     --providers "$PROVIDERS" \
     --execute --acknowledge-quota \
     --max-google-requests 14 \

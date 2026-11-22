@@ -104,7 +104,7 @@ from selenium.common.exceptions import (
 # =========================
 
 BASE_DIR = os.environ.get("PANDI_CRAWLER_BASE_DIR", "/home/fauzi/crawler")
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+CONFIG_PATH = os.environ.get("BIMA_CONFIG_FILE") or os.path.join(BASE_DIR, "config.json")
 
 URLS_PATH = os.path.join(BASE_DIR, "urls.json")
 

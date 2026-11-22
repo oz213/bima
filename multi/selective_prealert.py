@@ -410,7 +410,8 @@ def decide(db_path, callback_data, chat, sender, allowed, chat_type):
 
 
 def _sender_config(config_path=None):
-    path = (config_path or os.environ.get('BIMA_PREALERT_CONFIG_PATH') or
+    path = (config_path or os.environ.get('BIMA_CONFIG_FILE') or
+            os.environ.get('BIMA_PREALERT_CONFIG_PATH') or
             str(Path(os.environ.get('PANDI_CRAWLER_BASE_DIR',
                         str(Path(__file__).resolve().parents[1]))) / 'config.json'))
     cfg = json.loads(Path(path).read_text(encoding='utf-8'))

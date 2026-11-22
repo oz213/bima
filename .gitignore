@@ -17,6 +17,7 @@ logs/
 # Credentials and local configuration
 config.json
 /urls.json
+/multi/telegram_monitor.env
 .env
 .env.*
 *.pem
