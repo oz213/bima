@@ -61,7 +61,8 @@ def status_report(connection):
         f"Retry HTTP/DNS  : {fmt_int(counts.get('retry_http', 0))}\n"
         f"Inconclusive    : {fmt_int(counts.get('inconclusive', 0))}\n"
         f"Alert BIMA OK   : {fmt_int(counts.get('alerted', 0))}\n"
-        f"Alert pending   : {fmt_int(counts.get('pending_alert', 0))}"
+        f"Alert pending   : {fmt_int(counts.get('pending_alert', 0))}\n"
+        f"Dilindungi lama : {fmt_int(counts.get('protected_previous', 0))}"
     )
     if other:
         msg += f"\nStatus lain     : {fmt_int(other)}"
@@ -70,12 +71,15 @@ def status_report(connection):
 
 
 def inconclusive_report(connection):
+    source, _cycle = jobs_source(connection)
     rows = connection.execute(
-        "SELECT COALESCE(reason, 'unknown') AS reason, COUNT(*) AS n "
-        "FROM jobs WHERE status = 'inconclusive' "
-        "GROUP BY reason ORDER BY n DESC LIMIT 10"
+        "SELECT COALESCE(j.reason, 'unknown') AS reason, COUNT(*) AS n "
+        f"FROM {source} WHERE j.status = 'inconclusive' "
+        "GROUP BY j.reason ORDER BY n DESC LIMIT 10"
     ).fetchall()
-    total = int(connection.execute("SELECT COUNT(*) FROM jobs WHERE status='inconclusive'").fetchone()[0])
+    total = int(connection.execute(
+        f"SELECT COUNT(*) FROM {source} WHERE j.status='inconclusive'"
+    ).fetchone()[0])
     msg = f"INCONCLUSIVE | {fmt_int(total)} URL (hingga 10 alasan)\n"
     if not rows:
         return msg + "Tidak ada URL berstatus inconclusive."

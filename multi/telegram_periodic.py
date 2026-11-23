@@ -27,9 +27,10 @@ def rows_for(conn, status, limit=2):
     if not ucol:
         return []
     order = next((x for x in ('updated_at', 'last_attempt_at', 'last_checked_at', 'last_crawled_at', 'completed_at', 'id') if x in cols), None)
-    sql = f'SELECT {quote(ucol)} FROM jobs WHERE status = ?'
+    source, _cycle = jobs_source(conn)
+    sql = f'SELECT j.{quote(ucol)} FROM {source} WHERE j.status = ?'
     if order:
-        sql += f' ORDER BY {quote(order)} DESC'
+        sql += f' ORDER BY j.{quote(order)} DESC'
     sql += ' LIMIT ?'
     return [str(r[0]) for r in conn.execute(sql, (status, limit)) if r[0]]
 
@@ -44,9 +45,8 @@ def display_url(raw):
 
 
 def render_report(conn, previous):
-    counts = dict(conn.execute('SELECT status, COUNT(*) FROM jobs GROUP BY status').fetchall())
-    total = sum(counts.values())
-    processed = total - counts.get('pending', 0)
+    counts, total, _attempted, _cycle = current_counts(conn)
+    processed = total - counts.get('pending', 0) - counts.get('protected_previous', 0)
     delta = max(0, processed - previous) if previous is not None else 0
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     host = html.escape(socket.getfqdn())
@@ -58,6 +58,7 @@ def render_report(conn, previous):
         f'Perubahan sejak laporan sebelumnya: +{delta:,}',
         f'Selesai: {counts.get("complete", 0):,} | Alert BIMA: {counts.get("alerted", 0):,}',
         f'Retry: {counts.get("retry_http", 0):,} | Inconclusive: {counts.get("inconclusive", 0):,}',
+        f'Dilindungi riwayat: {counts.get("protected_previous", 0):,}',
         f'HTTP aktif: {counts.get("http_inflight", 0):,} | Browser queued: {counts.get("browser_queued", 0):,}',
     ]
     active_http = rows_for(conn, 'http_inflight')
@@ -70,9 +71,10 @@ def render_report(conn, previous):
     url_col = next((c for c in ('url', 'domain_name', 'domain', 'hostname') if c in cols), None)
     time_col = next((c for c in ('updated_at', 'last_attempt_at', 'last_checked_at', 'last_crawled_at', 'completed_at') if c in cols), None)
     if url_col:
-        fields = [quote(url_col), 'status'] + (['reason'] if 'reason' in cols else [])
-        query = 'SELECT ' + ', '.join(fields) + ' FROM jobs WHERE status NOT IN (\'pending\', \'http_inflight\', \'browser_queued\')'
-        query += ' ORDER BY ' + (quote(time_col) + ' DESC' if time_col else 'rowid DESC') + ' LIMIT 5'
+        source, _cycle = jobs_source(conn)
+        fields = ['j.' + quote(url_col), 'j.status'] + (['j.reason'] if 'reason' in cols else [])
+        query = 'SELECT ' + ', '.join(fields) + f' FROM {source} WHERE j.status NOT IN (\'pending\', \'http_inflight\', \'browser_queued\')'
+        query += ' ORDER BY ' + ('j.' + quote(time_col) + ' DESC' if time_col else 'j.rowid DESC') + ' LIMIT 5'
         recent = conn.execute(query).fetchall()
         if recent:
             lines.append('Hasil tersimpan (' + ('terbaru' if time_col else 'contoh') + '):')
@@ -127,7 +129,8 @@ def main():
             print(f'Telegram send failed for chat {chat_id}: {type(exc).__name__}', file=sys.stderr)
             raise SystemExit(1)
     tmp = STATE.with_suffix('.tmp')
-    tmp.write_text(json.dumps({'processed': processed, 'at': datetime.now(timezone.utc).isoformat()}))
+    tmp.write_text(json.dumps({'processed': processed, 'cycle': cycle,
+                               'at': datetime.now(timezone.utc).isoformat()}))
     os.replace(tmp, STATE)
     print(f'Telegram periodic summary sent to {len(chat_ids)} chat(s); processed={processed}; total={report.count(chr(10))+1} lines')
 
