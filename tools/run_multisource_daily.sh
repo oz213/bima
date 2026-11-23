@@ -1,5 +1,5 @@
 #!/bin/sh
-# BIMA v4.3.8 daily discovery; bounded queue import is opt-in and fail-closed.
+# BIMA daily discovery; all valid import candidates queued when opt-in is enabled.
 set -eu
 umask 077
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
@@ -121,10 +121,9 @@ if (set -C; : > "$MARKER") 2>/dev/null; then
     --spool-dir "$SPOOL_DIR" \
     --db "$ROOT/multi/state/crawler_production.sqlite3" \
     --domains "$ROOT/domains.json" \
-    --max-new 5 \
-    --max-priority 20 \
-    --max-pending 10000 \
-    --allow-priority-over-pending-ceiling \
+    --max-new 0 \
+    --max-priority 0 \
+    --max-pending 0 \
     --apply --acknowledge-queue-write \
     >> "$LOG_DIR/multi-source-import.jsonl" \
     2>> "$LOG_DIR/multi-source-errors.log"

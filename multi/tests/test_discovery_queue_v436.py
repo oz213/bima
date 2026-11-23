@@ -274,11 +274,16 @@ class ValidationTests(QueueFixture):
         with self.assertRaisesRegex(dq.QueueImportError, 'defaults'):
             self.apply()
 
-    def test_limits_reject_unbounded_values(self):
-        for value in (0, -1, 101):
+    def test_limits_allow_unbounded_but_reject_negative_values(self):
+        for value in (0, 101):
             self.args.max_new = value
-            with self.assertRaises(dq.QueueImportError):
-                self.preview()
+            self.assertEqual(
+                self.preview()['would_insert'], len(self.urls)
+            )
+
+        self.args.max_new = -1
+        with self.assertRaises(dq.QueueImportError):
+            self.preview()
 
     def test_rejects_symlinked_jsonl(self):
         alias = self.base / 'alias.jsonl'

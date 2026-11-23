@@ -203,10 +203,11 @@ def _pending(conn):
 def audit(args):
     if args.apply and not args.acknowledge_queue_write:
         raise QueueImportError('--apply requires --acknowledge-queue-write')
-    if (args.max_pending < 1 or args.max_pending > 3000000
-            or not 1 <= args.max_new <= 100
-            or not 1 <= getattr(args, 'max_priority', 20) <= 100):
-        raise QueueImportError('max-pending must be 1..3000000; max-new and max-priority 1..100')
+    # 0 explicitly means no volume limit; negative limits fail closed.
+    # Positive values retain the original manual/legacy throttling behavior.
+    if (args.max_pending < 0 or args.max_new < 0
+            or getattr(args, 'max_priority', 20) < 0):
+        raise QueueImportError('Import limits must be nonnegative (0 means no volume cap)')
     scopes = load_scopes(args.domains)
     candidates, counters = _read_log(args.input, scopes)
     if Path(args.db).resolve() == Path(args.input).resolve():
@@ -239,10 +240,15 @@ def audit(args):
                     existing += 1
                     if job[1] == 'pending' and (not known_priority_table or not _is_prioritized(conn, job[0])):
                         promotable_pending += 1
-            capacity = (args.max_new if getattr(args, 'allow_priority_over_pending_ceiling', False)
-                        else max(0, min(args.max_new, args.max_pending - pending)))
-            available_priority = max(0, getattr(args, 'max_priority', 20) -
-                                     (pending_priority_count(conn) if known_priority_table else 0))
+            capacity = missing if args.max_new == 0 else args.max_new
+            if args.max_pending and not getattr(args, 'allow_priority_over_pending_ceiling', False):
+                capacity = min(capacity, max(0, args.max_pending - pending))
+            priority_limit = getattr(args, 'max_priority', 20)
+            available_priority = (
+                missing + promotable_pending if priority_limit == 0
+                else max(0, priority_limit - (pending_priority_count(conn)
+                                              if known_priority_table else 0))
+            )
             # Existing pending jobs can be promoted without inflating backlog.
             # New inserts are bounded by both the pending ceiling and lane cap.
             possible_promotions = min(promotable_pending, available_priority)
@@ -254,7 +260,7 @@ def audit(args):
                 'would_insert': min(missing, capacity,
                                     max(0, available_priority - possible_promotions)),
                 'pending_discovery_priority': pending_priority_count(conn),
-                'blocked_by_pending_limit': pending >= args.max_pending,
+                'blocked_by_pending_limit': bool(args.max_pending and pending >= args.max_pending),
             })
             return result
         # Hold one IMMEDIATE transaction for both jobs and priority metadata.
@@ -264,9 +270,14 @@ def audit(args):
             pending = _pending(conn)
             result['pending_before'] = pending
             conn.execute(PRIORITY_SCHEMA)
+            # Keep FIFO priority lookups inexpensive as unbounded imports grow.
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_discovery_priority_fifo_v10 '
+                         'ON discovery_job_priority(discovered_at,job_id)')
             removed_finished = cleanup_finished_priorities(conn)
             lane_before = pending_priority_count(conn)
-            lane_capacity = max(0, getattr(args, 'max_priority', 20) - lane_before)
+            priority_limit = getattr(args, 'max_priority', 20)
+            lane_capacity = (len(candidates) if priority_limit == 0
+                             else max(0, priority_limit - lane_before))
             inserted = 0
             existing = 0
             promoted_existing = 0
@@ -290,8 +301,8 @@ def audit(args):
                         priority_added += 1
                         promoted_existing += 1
                     continue
-                if (inserted >= args.max_new or
-                        (pending >= args.max_pending and
+                if ((args.max_new and inserted >= args.max_new) or
+                        (args.max_pending and pending >= args.max_pending and
                          not getattr(args, 'allow_priority_over_pending_ceiling', False))):
                     continue
                 cursor = conn.execute(
@@ -317,7 +328,7 @@ def audit(args):
                 'pending_discovery_priority_before': lane_before,
                 'pending_discovery_priority_after': pending_priority_count(conn),
                 'finished_priority_cleaned': removed_finished,
-                'blocked_by_pending_limit': pending >= args.max_pending,
+                'blocked_by_pending_limit': bool(args.max_pending and pending >= args.max_pending),
             })
     return result
 
@@ -328,14 +339,15 @@ def make_parser():
                    help='Existing multi_source_discovery.py JSONL log (not Google v4.3.3 log)')
     p.add_argument('--db', default='multi/state/crawler_production.sqlite3')
     p.add_argument('--domains', default='domains.json')
-    p.add_argument('--max-new', type=int, default=20)
-    p.add_argument('--max-pending', type=int, default=10000,
-                   help='Backpressure guard; large Registry backlogs may prevent new jobs')
-    p.add_argument('--max-priority', type=int, default=20,
-                   help='Maximum active pending Discovery priority jobs (1..100)')
+    p.add_argument('--max-new', type=int, default=0,
+                   help='New jobs per run; 0 (default) means all valid candidates')
+    p.add_argument('--max-pending', type=int, default=0,
+                   help='Total pending backlog ceiling; 0 (default) means no volume ceiling')
+    p.add_argument('--max-priority', type=int, default=0,
+                   help='Active Discovery priority ceiling; 0 (default) means no volume ceiling')
     p.add_argument('--allow-priority-over-pending-ceiling', action='store_true',
                    help='EXPLICIT: bounded Discovery inserts even if Registry pending exceeds max-pending')
-    p.add_argument('--apply', action='store_true', help='Insert a bounded number of new jobs')
+    p.add_argument('--apply', action='store_true', help='Insert all eligible validated candidates')
     p.add_argument('--acknowledge-queue-write', action='store_true',
                    help='Confirm an intentional write to live crawler jobs')
     return p

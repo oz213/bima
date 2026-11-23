@@ -190,10 +190,12 @@ class DailyImportTests(DailyImportFixture):
         self.assertEqual(self.rows(), [])
         self.assertTrue(path.exists())
 
-    def test_max_new_above_five_rejected(self):
-        self.args.max_new = 6
-        with self.assertRaisesRegex(daily.QueueImportError, '1..5'):
-            daily.drain(self.args)
+    def test_max_new_above_five_supported(self):
+        self.write_run('AAAAAAA1', [f'https://a.co.id/{x}' for x in range(8)])
+        self.args.max_new = 8
+        self.args.max_priority = 8
+        self.assertEqual(self.apply()['new_jobs'], 8)
+        self.assertEqual(len(self.rows()), 8)
 
     def test_skips_nonmatching_files(self):
         (self.spool / 'other.jsonl').write_text('BAD\n')
@@ -263,7 +265,10 @@ esac
     def test_opt_in_one_import_per_utc_day(self):
         p = self.run_daily(BIMA_DISCOVERY_AUTO_IMPORT='1')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('--max-new 5', (self.home / 'import-args').read_text())
+        args_line = (self.home / 'import-args').read_text()
+        self.assertIn('--max-new 0', args_line)
+        self.assertIn('--max-priority 0', args_line)
+        self.assertIn('--max-pending 0', args_line)
         self.assertIn('--apply --acknowledge-queue-write', (self.home / 'import-args').read_text())
         spool = self.log / 'multi-source-pending'
         self.assertEqual(spool.stat().st_mode & 0o777, 0o700)

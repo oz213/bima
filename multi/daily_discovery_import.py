@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""BIMA v4.3.8: bounded FIFO import of *per-run* Google/urlscan JSONL spool.
+"""BIMA: import every eligible Google/urlscan candidate from private FIFO spools.
 
-This tool never contacts search providers or starts the crawler. A daily cron
-wrapper opts in explicitly, caps one invocation per UTC day, and uses this
-module to import no more than five new jobs per scheduled invocation. Input is
-only private, per-run JSONL files, never the entire historical discovery log.
-Brave URLs are excluded by the existing discovery_queue importer.
+This tool never contacts providers or starts the crawler. The operator-controlled
+cron still performs at most one automatic import invocation per UTC day; 0 in
+volume-limit flags means unlimited eligible candidates, not unlimited provider
+API calls or unsafe/unbounded input-file sizes. Brave results stay excluded.
 """
 from __future__ import annotations
 
@@ -61,9 +60,8 @@ def _args(args, path, *, apply, new_limit):
 def drain(args):
     if args.apply and not args.acknowledge_queue_write:
         raise QueueImportError('--apply requires --acknowledge-queue-write')
-    if (not 1 <= args.max_new <= 5 or not 1 <= args.max_priority <= 100 or
-            not 1 <= args.max_pending <= 3000000):
-        raise QueueImportError('Daily import limits invalid: max-new 1..5, max-priority 1..100')
+    if args.max_new < 0 or args.max_priority < 0 or args.max_pending < 0:
+        raise QueueImportError('Daily import limits must be >=0 (0 means no volume cap)')
     files = _list_spool(Path(args.spool_dir))
     result = {
         'ok': True, 'version': '4.3.8', 'mode': 'apply' if args.apply else 'preview',
@@ -75,18 +73,20 @@ def drain(args):
         'max_priority': args.max_priority,
         'priority_backlog_override': args.allow_priority_over_pending_ceiling,
     }
-    remaining = args.max_new
+    remaining = None if args.max_new == 0 else args.max_new
     for path in files:
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             break
         result['spool_files_examined'] += 1
         before = path.lstat()
-        current = audit(_args(args, path, apply=args.apply, new_limit=remaining))
+        current = audit(_args(args, path, apply=args.apply,
+                              new_limit=0 if remaining is None else remaining))
         if args.apply:
             n = int(current['new_jobs'])
-            if n > remaining:
-                raise QueueImportError('Daily importer returned more new jobs than the remaining allowance')
-            remaining -= n
+            if remaining is not None:
+                if n > remaining:
+                    raise QueueImportError('Daily importer exceeded the remaining allowance')
+                remaining -= n
             result['new_jobs'] += n
             result['promoted_existing_pending'] += current.get('promoted_existing_pending', 0)
             result['priority_added'] += current.get('priority_added', 0)
@@ -101,13 +101,15 @@ def drain(args):
                 path.unlink()
                 result['spool_files_drained'] += 1
             # When the lane is full, scanning more input cannot add priorities.
-            if current.get('pending_discovery_priority_after', 0) >= args.max_priority:
+            if (args.max_priority and
+                    current.get('pending_discovery_priority_after', 0) >= args.max_priority):
                 break
         else:
             result['new_jobs'] += current['would_insert']
             result['promoted_existing_pending'] += current['would_promote_existing']
             # Preview counts are upper bounds across files: no reservations made.
-            remaining -= current['would_insert']
+            if remaining is not None:
+                remaining -= current['would_insert']
     result['spool_files_pending_after'] = len(_list_spool(Path(args.spool_dir)))
     return result
 
@@ -117,9 +119,12 @@ def main(argv=None):
     parser.add_argument('--spool-dir', required=True)
     parser.add_argument('--db', default='multi/state/crawler_production.sqlite3')
     parser.add_argument('--domains', default='domains.json')
-    parser.add_argument('--max-new', type=int, default=5)
-    parser.add_argument('--max-priority', type=int, default=20)
-    parser.add_argument('--max-pending', type=int, default=10000)
+    parser.add_argument('--max-new', type=int, default=0,
+                        help='0: import all eligible new jobs')
+    parser.add_argument('--max-priority', type=int, default=0,
+                        help='0: no Discovery priority lane ceiling')
+    parser.add_argument('--max-pending', type=int, default=0,
+                        help='0: no global pending count ceiling')
     parser.add_argument('--allow-priority-over-pending-ceiling', action='store_true')
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--acknowledge-queue-write', action='store_true')
