@@ -1,0 +1,24 @@
+[Unit]
+Description=BIMA Phase-1 read-only production health monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fauzi
+Group=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=BIMA_HEALTH_NOTIFY=0
+StateDirectory=pandi-bima-health
+StateDirectoryMode=0700
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B /home/fauzi/crawler-rebuild/tools/bima_production_health_v8.py --tick --json
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

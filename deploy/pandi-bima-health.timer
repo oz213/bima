@@ -1,0 +1,11 @@
+[Unit]
+Description=Run BIMA read-only health checks every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=pandi-bima-health.service
+
+[Install]
+WantedBy=timers.target
