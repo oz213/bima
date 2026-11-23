@@ -1,4 +1,4 @@
-"""Safe, versioned Registry snapshots. Only the explicit operator CLI writes cycles.
+"""Versioned Registry snapshots; every URL in each dataset is recrawled.
 
 The live crawler reads the active snapshot's pending queue; Telegram/Discovery
 keep their existing paths. The per-job ID is never recycled or deleted.
@@ -13,6 +13,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+RESET_JOB_COLUMNS = "status='pending', attempts=0, http_ms=NULL, browser_ms=NULL, http_status=NULL, reason=NULL,risk=NULL, classifier_json=NULL,final_url=NULL,evidence_path=NULL, alert_confidence=NULL,error=NULL,route_reason=NULL, error_category=NULL,classification_ms=NULL,next_retry_at=NULL, bert_ms=NULL,dns_result=NULL,dns_errno=NULL,dns_host=NULL,updated_at=?"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS registry_snapshot_runs_v2 (
@@ -180,9 +182,10 @@ def _reset_where(conn):
 
 
 def apply_snapshot(conn, *, cycle_id, snapshot, allow_major_shrink=False):
-    """Atomic DB cutover. Caller must stop BOTH Telegram and crawler services.
+    """Atomic cutover: requeue every current snapshot URL, including prior alerts.
 
-    Does not delete job IDs, review, alert, evidence, training or delivery state.
+    Caller must stop BOTH services. Keep job IDs and audit/history tables;
+    the destination BIMA system is responsible for duplicate-alert control.
     A separate input-file atomic replacement is done by the operator CLI.
     """
     cycle_id = _safe_cycle_id(cycle_id)
@@ -227,61 +230,31 @@ def apply_snapshot(conn, *, cycle_id, snapshot, allow_major_shrink=False):
         conn.executemany('INSERT INTO registry_snapshot_source_v2 VALUES (?,?,?)',
                          ((seq, url, (urlsplit(url).hostname or '').lower().rstrip('.'))
                           for seq, url in enumerate(snapshot['urls'], start=1)))
-        # Block cross-scheme duplicates: http://host and https://host are
-        # different job IDs, but must not automatically send duplicate alerts.
-        conn.execute('DROP TABLE IF EXISTS temp.registry_protected_hosts_v2')
-        conn.execute('CREATE TEMP TABLE registry_protected_hosts_v2 '
-                     '(hostname TEXT PRIMARY KEY)')
-        protected_urls = [r[0] for r in conn.execute(
-            "SELECT url FROM jobs WHERE status IN "
-            "('alerted','pending_alert','prealert_send_unknown','review_approved',"
-            "'review_rejected','awaiting_review','review_required')")]
-        if has_table(conn, 'bima_prealerts'):
-            protected_urls.extend(r[0] for r in conn.execute(
-                'SELECT j.url FROM jobs j JOIN bima_prealerts b ON b.job_id=j.id'))
-        if has_table(conn, 'telegram_checks'):
-            protected_urls.extend(r[0] for r in conn.execute(
-                'SELECT j.url FROM jobs j JOIN telegram_checks t ON t.job_id=j.id'))
-        protected_hosts = set()
-        for old_url in protected_urls:
-            try:
-                host = (urlsplit(old_url or '').hostname or '').lower().rstrip('.')
-                if host:
-                    protected_hosts.add(host)
-            except (ValueError, AttributeError):
-                continue
-        conn.executemany('INSERT INTO registry_protected_hosts_v2 VALUES (?)',
-                         ((host,) for host in protected_hosts))
+        # Do not exclude previously alerted/reviewed hosts from recrawling.
         now = _utcnow()
         conn.execute('INSERT OR IGNORE INTO jobs(url,updated_at) '
                      'SELECT url,? FROM registry_snapshot_source_v2', (now,))
-        exclusion = _table_exclusion(conn)
-        statuses = ','.join("'" + st + "'" for st in RESETTABLE)
-        where = ("j.status IN (" + statuses + ")" + exclusion
-                 + ' AND NOT EXISTS (SELECT 1 FROM registry_protected_hosts_v2 h '
-                   'WHERE h.hostname=s.hostname)')
+        # Record previous completed/review/alert states once per cycle.
+        # Freshly inserted pending jobs have no prior work to archive.
+        where = "(j.status <> 'pending' OR j.attempts <> 0)"
         conn.execute('INSERT INTO registry_snapshot_job_history_v2 '
                      '(cycle_id,job_id,previous_status,attempts,risk,reason,classifier_json,updated_at) '
                      'SELECT ?,j.id,j.status,j.attempts,j.risk,j.reason,j.classifier_json,j.updated_at '
                      'FROM jobs j JOIN registry_snapshot_source_v2 s ON s.url=j.url '
                      'WHERE ' + where, (cycle_id,))
         archived = conn.execute('SELECT changes()').fetchone()[0]
-        # Existing alert cases are intentionally NOT requeued, even if sites changed.
+        # Recrawl all URLs; BIMA handles duplicate alert rejection.
         conn.execute('DELETE FROM registry_snapshot_queue_v2')
-        conn.execute("UPDATE jobs SET status='pending', attempts=0, http_ms=NULL, "
-                     "browser_ms=NULL, http_status=NULL, reason=NULL,risk=NULL, "
-                     "classifier_json=NULL,final_url=NULL,evidence_path=NULL, "
-                     "alert_confidence=NULL,error=NULL,route_reason=NULL, "
-                     "error_category=NULL,classification_ms=NULL,next_retry_at=NULL, "
-                     "bert_ms=NULL,dns_result=NULL,dns_errno=NULL,dns_host=NULL,updated_at=? "
-                     "WHERE id IN (SELECT job_id FROM registry_snapshot_job_history_v2 "
-                     "WHERE cycle_id=?)", (now, cycle_id))
+        # Reset every URL in the new snapshot, not just historical RESETTABLE
+        # statuses. This includes old alerted/review/Telegram-check jobs.
+        conn.execute(
+            f'UPDATE jobs SET {RESET_JOB_COLUMNS} '
+            'WHERE id IN (SELECT j.id FROM jobs j '
+            'JOIN registry_snapshot_source_v2 s ON s.url=j.url)', (now,)
+        )
         conn.execute('INSERT INTO registry_snapshot_queue_v2(job_id,ordinal,pending,blocked) '
-                     'SELECT j.id,s.ordinal, '
-                     'CASE WHEN j.status=\'pending\' AND h.hostname IS NULL THEN 1 ELSE 0 END, '
-                     'CASE WHEN h.hostname IS NULL THEN 0 ELSE 1 END '
-                     'FROM registry_snapshot_source_v2 s JOIN jobs j ON j.url=s.url '
-                     'LEFT JOIN registry_protected_hosts_v2 h ON h.hostname=s.hostname')
+                     'SELECT j.id,s.ordinal,1,0 '
+                     'FROM registry_snapshot_source_v2 s JOIN jobs j ON j.url=s.url')
         conn.execute('INSERT INTO registry_snapshot_runs_v2 '
                      '(cycle_id,source_sha256,url_count,skipped_invalid,created_at) '
                      'VALUES(?,?,?,?,?)',
@@ -298,6 +271,64 @@ def apply_snapshot(conn, *, cycle_id, snapshot, allow_major_shrink=False):
                 'invalid': snapshot['invalid'], 'requeued': archived,
                 'active_pending': pending, 'protected_hosts': blocked,
                 'protected_or_terminal': len(snapshot['urls']) - pending}
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def requeue_blocked_current_cycle(conn, *, expected_cycle):
+    """One-time migration: requeue blocked entries in the *existing* live cycle.
+
+    Both services must be stopped by the operator. This transaction keeps
+    job IDs and audit/outbox tables; an old job state is saved in cycle history.
+    Never starts a new cycle or edits urls.json.
+    """
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.execute('PRAGMA busy_timeout=30000')
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        actual_cycle = active_cycle(conn)
+        if actual_cycle != expected_cycle or not active_ready(conn):
+            raise ValueError('Current Registry cycle is not ready or does not match --confirm-cycle')
+        count = conn.execute(
+            'SELECT COUNT(*) FROM registry_snapshot_queue_v2 WHERE blocked=1'
+        ).fetchone()[0]
+        if not count:
+            conn.commit()
+            return {'cycle_id': actual_cycle, 'requeued': 0, 'remaining_blocked': 0}
+
+        # Preserve old status before clearing it; leave BIMA/Telegram history
+        # tables untouched.  Existing cycle history must never be overwritten.
+        conn.execute(
+            'INSERT OR IGNORE INTO registry_snapshot_job_history_v2 '
+            '(cycle_id,job_id,previous_status,attempts,risk,reason,classifier_json,updated_at) '
+            'SELECT ?,j.id,j.status,j.attempts,j.risk,j.reason,j.classifier_json,j.updated_at '
+            'FROM registry_snapshot_queue_v2 q JOIN jobs j ON j.id=q.job_id '
+            'WHERE q.blocked=1', (actual_cycle,)
+        )
+        now = _utcnow()
+        conn.execute(
+            f'UPDATE jobs SET {RESET_JOB_COLUMNS} '
+            'WHERE id IN (SELECT job_id FROM registry_snapshot_queue_v2 WHERE blocked=1)',
+            (now,)
+        )
+        # UPDATE status trigger sees blocked=1; release the queue *afterwards*.
+        conn.execute(
+            'UPDATE registry_snapshot_queue_v2 SET blocked=0,pending=1 WHERE blocked=1'
+        )
+        remaining = conn.execute(
+            'SELECT COUNT(*) FROM registry_snapshot_queue_v2 WHERE blocked=1'
+        ).fetchone()[0]
+        ready = conn.execute(
+            "SELECT COUNT(*) FROM registry_snapshot_queue_v2 q "
+            "JOIN jobs j ON j.id=q.job_id "
+            "WHERE q.pending=1 AND j.status='pending'"
+        ).fetchone()[0]
+        if remaining:
+            raise RuntimeError('Some blocked URL rows remain; transaction rolled back')
+        conn.commit()
+        return {'cycle_id': actual_cycle, 'requeued': count,
+                'remaining_blocked': remaining, 'pending_now': ready}
     except BaseException:
         conn.rollback()
         raise

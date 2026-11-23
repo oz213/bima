@@ -16,7 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'multi'))
-from registry_snapshot_v2 import active_cycle, active_ready, apply_snapshot, mark_ready, read_snapshot
+from registry_snapshot_v2 import (active_cycle, active_ready, apply_snapshot,
+                                  mark_ready, read_snapshot, requeue_blocked_current_cycle)
 
 SERVICES = ('pandi-crawler-multi.service', 'pandi-telegram-monitor.service')
 
@@ -78,8 +79,9 @@ def main(argv=None):
             *supplied[1:]
         ])
     parser = argparse.ArgumentParser(description='BIMA Registry snapshot lifecycle v2')
-    parser.add_argument('mode', choices=('preview', 'apply', 'status'))
+    parser.add_argument('mode', choices=('preview', 'apply', 'status', 'requeue-blocked'))
     parser.add_argument('--managed-by-rollover', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--confirm-cycle', help='Required for requeue-blocked; exact active cycle ID')
     parser.add_argument('--source', type=Path, help='Staged PDNS urls JSON file')
     parser.add_argument('--input', type=Path,
                         help='Actual --input path used by crawler systemd service')
@@ -95,6 +97,15 @@ def main(argv=None):
             raise RuntimeError('Direct apply has no managed NFS backup. Use: '
                                'sudo python3 tools/bima_registry_snapshot_v2.py rollover')
         db_path = args.db.resolve(strict=True)
+        if args.mode == 'requeue-blocked':
+            if not args.confirm_cycle:
+                raise ValueError('--confirm-cycle is required for requeue-blocked')
+            require_stopped()
+            with sqlite3.connect(str(db_path), timeout=30) as conn:
+                result = requeue_blocked_current_cycle(
+                    conn, expected_cycle=args.confirm_cycle)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.mode == 'status':
             with sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True) as conn:
                 conn.execute('PRAGMA query_only=ON')
