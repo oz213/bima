@@ -34,7 +34,7 @@ except ImportError:
 # =========================
 # Path
 # =========================
-BASE_DIR = "/home/fauzi/crawler"
+BASE_DIR = os.environ.get("PANDI_CRAWLER_BASE_DIR") or os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DOMAINS_PATH = os.path.join(BASE_DIR, "domains.json")
 MODEL_PATH = os.path.join(BASE_DIR, "gambling_classifier.pkl")
