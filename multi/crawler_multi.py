@@ -394,6 +394,14 @@ def classify_shared(engine, url, current_url, text, title, source='requests', pa
     """Preserve the existing IndoBERT/gambling decision; append opt-in shadow metadata."""
     result = _legacy_classify_shared(engine, url, current_url, text, title,
                                      source=source, page_html=page_html)
+    # Read-only shadow feed: original classifier has already made its decision.
+    # No second model is loaded here; sampler failure can never affect alerts.
+    if os.environ.get('BIMA_INDOBERT_SHADOW_CAPTURE') == '1':
+        try:
+            from shadow_capture_v1 import capture
+            capture(url, current_url, text, source, result)
+        except Exception:
+            pass
     if os.environ.get('BIMA_PHISHING_SHADOW') != '1':
         return result
     try:
