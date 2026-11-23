@@ -1,0 +1,12 @@
+[Unit]
+Description=BIMA isolated restore rehearsal every Sunday at 03:30 Asia/Jakarta
+
+[Timer]
+OnCalendar=Sun *-*-* 20:30:00 UTC
+AccuracySec=2min
+RandomizedDelaySec=1min
+Persistent=false
+Unit=pandi-bima-rehearsal.service
+
+[Install]
+WantedBy=timers.target

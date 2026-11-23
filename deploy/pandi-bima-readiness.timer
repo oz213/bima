@@ -1,0 +1,12 @@
+[Unit]
+Description=BIMA daily production readiness review at 04:00 Asia/Jakarta
+
+[Timer]
+OnCalendar=*-*-* 21:00:00 UTC
+AccuracySec=2min
+RandomizedDelaySec=1min
+Persistent=false
+Unit=pandi-bima-readiness.service
+
+[Install]
+WantedBy=timers.target

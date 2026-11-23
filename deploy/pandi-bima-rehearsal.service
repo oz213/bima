@@ -1,0 +1,22 @@
+[Unit]
+Description=BIMA Phase 1D isolated local restore rehearsal with full SQLite integrity check
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/registrar-sandbox/bima/backups/verified-sqlite
+
+[Service]
+Type=oneshot
+User=fauzi
+Group=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=pandi-bima-health
+StateDirectoryMode=0700
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B /home/fauzi/crawler-rebuild/tools/bima_resilience_v9.py rehearse
+TimeoutStartSec=1800
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true

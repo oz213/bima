@@ -1,0 +1,12 @@
+[Unit]
+Description=BIMA verified SQLite backup daily at 02:20 Asia/Jakarta (19:20 UTC)
+
+[Timer]
+OnCalendar=*-*-* 19:20:00 UTC
+AccuracySec=2min
+RandomizedDelaySec=1min
+Persistent=false
+Unit=pandi-bima-backup.service
+
+[Install]
+WantedBy=timers.target

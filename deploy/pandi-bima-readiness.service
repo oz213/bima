@@ -1,0 +1,19 @@
+[Unit]
+Description=BIMA Phase 1D production readiness report (read-only)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/registrar-sandbox/bima/backups/verified-sqlite
+
+[Service]
+Type=oneshot
+User=fauzi
+Group=fauzi
+WorkingDirectory=/home/fauzi/crawler-rebuild
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/fauzi/crawler-rebuild/venv/bin/python3 -B /home/fauzi/crawler-rebuild/tools/bima_resilience_v9.py readiness
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
