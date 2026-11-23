@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Telegram monitoring and on-demand checks."""
 from telegram_checks import normalize_input_url, request_check
+from registry_active_metrics import current_counts, jobs_source
 import json
 from contextlib import closing
 import logging
@@ -38,14 +39,8 @@ def open_db(path):
 
 
 def status_counts(connection):
-    rows = connection.execute(
-        "SELECT status, COUNT(*) AS count, "
-        "COALESCE(SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END), 0) AS attempted "
-        "FROM jobs GROUP BY status"
-    ).fetchall()
-    counts = {str(row["status"]): int(row["count"]) for row in rows}
-    attempted = sum(int(row["attempted"]) for row in rows)
-    total = sum(counts.values())
+    # Only count URLs in the current Registry snapshot, when one is published.
+    counts, total, attempted, _cycle = current_counts(connection)
     return counts, total, attempted
 
 
@@ -54,7 +49,7 @@ def status_report(connection):
     completed = counts.get("complete", 0) + counts.get("alerted", 0)
     other = total - sum(counts.get(key, 0) for key in (
         "pending", "complete", "alerted", "browser_queued", "retry_http",
-        "inconclusive", "pending_alert", "dry_run_alert"
+        "inconclusive", "pending_alert", "dry_run_alert", "protected_previous"
     ))
     msg = (
         "PANDI CRAWLER | PROGRESS\n"
@@ -87,7 +82,7 @@ def inconclusive_report(connection):
     for r in rows:
         msg += f"- {r['reason']}: {fmt_int(r['n'])}\n"
     examples = connection.execute(
-        "SELECT url, reason FROM jobs WHERE status='inconclusive' LIMIT 5"
+        f"SELECT j.url,j.reason FROM {source} WHERE j.status='inconclusive' LIMIT 5"
     ).fetchall()
     if examples:
         msg += "\nContoh URL:\n"
@@ -108,9 +103,11 @@ def bima_report(connection):
 
 
 def dns_report(connection):
+    source, _cycle = jobs_source(connection)
     rows = connection.execute(
-        "SELECT COALESCE(dns_result,'none') AS dns_result, COUNT(*) AS n "
-        "FROM jobs WHERE status='retry_http' GROUP BY dns_result ORDER BY n DESC LIMIT 12"
+        "SELECT COALESCE(j.dns_result,'none') AS dns_result, COUNT(*) AS n "
+        f"FROM {source} WHERE j.status='retry_http' GROUP BY j.dns_result "
+        "ORDER BY n DESC LIMIT 12"
     ).fetchall()
     if not rows:
         return "DNS/HTTP RETRY\nTidak ada URL berstatus retry_http."
@@ -160,10 +157,12 @@ def status_label(status, risk=None, reason=None):
 def latest_rows(connection, limit=5):
     """Last saved results; NOT live HTTP activity. No index changes in production."""
     limit = max(1, min(int(limit), 10))
+    source, _cycle = jobs_source(connection)
     return connection.execute(
-        "SELECT url, status, reason, risk, updated_at FROM jobs "
-        "WHERE attempts > 0 AND status NOT IN ('pending','http_inflight','browser_queued') "
-        "ORDER BY updated_at DESC, id DESC LIMIT ?", (limit,)
+        "SELECT j.url, j.status, j.reason, j.risk, j.updated_at "
+        f"FROM {source} "
+        "WHERE j.attempts > 0 AND j.status NOT IN ('pending','http_inflight','browser_queued') "
+        "ORDER BY j.updated_at DESC, j.id DESC LIMIT ?", (limit,)
     ).fetchall()
 
 
@@ -173,12 +172,15 @@ def active_report(connection):
         ('http_inflight', 'HTTP inflight (belum tentu sudah selesai)'),
         ('browser_queued', 'Antrean / proses Selenium'),
     )
+    source, _cycle = jobs_source(connection)
     for status, label in groups:
-        total = int(connection.execute('SELECT COUNT(*) FROM jobs WHERE status=?', (status,)).fetchone()[0])
+        total = int(connection.execute(
+            f'SELECT COUNT(*) FROM {source} WHERE j.status=?', (status,)
+        ).fetchone()[0])
         msg.append(f'\n{label}: {fmt_int(total)} URL')
         rows = connection.execute(
-            'SELECT url, updated_at FROM jobs WHERE status=? ORDER BY id DESC LIMIT 4',
-            (status,)
+            f'SELECT j.url, j.updated_at FROM {source} WHERE j.status=? '
+            'ORDER BY j.id DESC LIMIT 4', (status,)
         ).fetchall()
         for row in rows:
             msg.append(f'- {safe_domain(row["url"])} ({row["updated_at"] or "-"} UTC)')

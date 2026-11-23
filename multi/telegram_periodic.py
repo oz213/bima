@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
+from registry_active_metrics import active_cycle, current_counts, jobs_source
 
 DB = Path(os.environ.get('CRAWLER_DB_PATH', '/home/fauzi/crawler-rebuild/multi/state/crawler_production.sqlite3'))
 STATE = DB.parent / '.telegram_periodic_state.json'
@@ -91,13 +92,19 @@ def main():
     if not preview and (not token or not chat_ids):
         raise SystemExit('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_CHAT_IDS')
     previous = None
+    previous_cycle = None
     if STATE.is_file():
         try:
-            previous = int(json.loads(STATE.read_text()).get('processed'))
+            saved = json.loads(STATE.read_text())
+            previous = int(saved.get('processed'))
+            previous_cycle = saved.get('cycle')
         except (ValueError, TypeError, OSError):
             pass
     with sqlite3.connect(DB.resolve().as_uri() + '?mode=ro', uri=True, timeout=15) as conn:
         conn.execute('PRAGMA query_only = ON')
+        cycle = active_cycle(conn)
+        if cycle != previous_cycle:
+            previous = None  # New dataset: never compare to the old cycle.
         report, processed = render_report(conn, previous)
     if preview:
         print(report)

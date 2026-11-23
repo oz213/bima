@@ -170,6 +170,41 @@ print('BACKUP VERIFIED: ' + str(backup), flush=True)
 '''
 
 
+MARK_CODE = r'''
+import json, os, sys
+from pathlib import Path
+folder = Path(sys.argv[1])
+cycle = sys.argv[2]
+if folder.name != cycle or not (folder / 'crawler_production.sqlite3').is_file():
+    raise RuntimeError('Backup marker preflight failed')
+marker = folder / '.bima-registry-rollover-v3.json'
+marker.write_text(json.dumps({'format': 'bima-registry-rollover-v3', 'cycle': cycle}) + '\n')
+os.chmod(marker, 0o600)
+'''
+
+PRUNE_CODE = r'''
+import json, shutil, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve(strict=True)
+keep = sys.argv[2]
+for old in sorted(root.iterdir()):
+    if old.name == keep or old.is_symlink() or not old.is_dir():
+        continue
+    marker = old / '.bima-registry-rollover-v3.json'
+    if marker.is_symlink() or not marker.is_file():
+        continue  # Do not delete manually managed or legacy backups.
+    try:
+        data = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        continue
+    if data != {'format': 'bima-registry-rollover-v3', 'cycle': old.name}:
+        continue
+    if not (old / 'crawler_production.sqlite3').is_file():
+        continue
+    shutil.rmtree(old)
+    print('RETENTION deleted previous managed rollover backup: ' + str(old), flush=True)
+'''
+
 class Rollover:
     def __init__(self, options):
         self.args = options
@@ -193,6 +228,8 @@ class Rollover:
 
     def invoke_tool(self, mode):
         params = [self.python, '-B', self.tool, mode, '--db', self.db]
+        if mode == 'apply':
+            params.append('--managed-by-rollover')
         if mode != 'status':
             params += ['--source', self.source, '--input', self.target,
                        '--cycle', self.cycle, '--min-urls', str(self.args.min_urls)]
@@ -278,9 +315,15 @@ class Rollover:
             if self.target.is_file() and not (self.backup_dir / 'urls.json').is_file():
                 raise CutoverError('Previous urls.json backup is incomplete; inspect ' + str(self.backup_dir))
             report('Existing backup verified: ' + str(self.backup_dir))
+            self.owner(self.python, '-B', '-c', MARK_CODE, self.backup_dir, self.cycle)
             return
         self.owner(self.python, '-B', '-c', BACKUP_CODE, self.backup_dir,
                    self.db, self.learning, self.target)
+        self.owner(self.python, '-B', '-c', MARK_CODE, self.backup_dir, self.cycle)
+
+    def prune_previous_backups(self):
+        # Only delete backups created by this managed workflow, after success.
+        self.owner(self.python, '-B', '-c', PRUNE_CODE, self.backup_root, self.cycle)
 
     def restored_state(self):
         current = state_readonly(self.db)
@@ -358,6 +401,10 @@ class Rollover:
             try:
                 archive = self.archive_staged()
                 report('Staging archived: ' + str(archive))
+                try:
+                    self.prune_previous_backups()
+                except (CutoverError, OSError) as cleanup_error:
+                    report('WARNING: new cycle is healthy, old backup retained: ' + str(cleanup_error))
             except (CutoverError, OSError) as exc:
                 report('WARNING: snapshot is active, but staging could not be archived: ' + str(exc))
             report('SUCCESS: cycle=%s, crawler PID=%s' % (self.cycle, pid))

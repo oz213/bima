@@ -66,8 +66,20 @@ def atomic_copy(source, target, expected_sha256):
 
 
 def main(argv=None):
+    # The 'rollover' entrypoint provides one NFS backup, service coordination,
+    # and one-backup retention. The low-level 'apply' remains an internal tool.
+    supplied = list(sys.argv[1:] if argv is None else argv)
+    if supplied and supplied[0] == 'rollover':
+        if os.geteuid() != 0:
+            print('ERROR: rollover requires sudo/root', file=sys.stderr)
+            return 1
+        return subprocess.call([
+            sys.executable, str(ROOT / 'tools/bima_registry_rollover_v2.py'),
+            *supplied[1:]
+        ])
     parser = argparse.ArgumentParser(description='BIMA Registry snapshot lifecycle v2')
     parser.add_argument('mode', choices=('preview', 'apply', 'status'))
+    parser.add_argument('--managed-by-rollover', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--source', type=Path, help='Staged PDNS urls JSON file')
     parser.add_argument('--input', type=Path,
                         help='Actual --input path used by crawler systemd service')
@@ -79,6 +91,9 @@ def main(argv=None):
                         help='Explicitly acknowledge >50%% shrink compared with prior cycle')
     args = parser.parse_args(argv)
     try:
+        if args.mode == 'apply' and not args.managed_by_rollover:
+            raise RuntimeError('Direct apply has no managed NFS backup. Use: '
+                               'sudo python3 tools/bima_registry_snapshot_v2.py rollover')
         db_path = args.db.resolve(strict=True)
         if args.mode == 'status':
             with sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True) as conn:
