@@ -162,6 +162,15 @@ def enrich_classification(result, *, initial_url, current_url, page_html, enviro
     try:
         html = page_html() if callable(page_html) else page_html
         triage = inspect_html(html, current_url, initial_url)
+        # v12 is a separately opt-in, metadata-only extension. Failure must
+        # never erase the v1 observation or alter the gambling decision.
+        if env.get('BIMA_PHISHING_V12') == '1':
+            try:
+                from phishing_signals_v12 import extend_triage
+                triage = extend_triage(triage, html, current_url, initial_url)
+            except Exception:
+                triage = dict(triage)
+                triage['v12_error'] = 'scanner_error'
     except Exception:
         triage = {'version': VERSION, 'status': 'scanner_error', 'signal_codes': []}
     output = dict(result)
@@ -174,11 +183,16 @@ def main(argv=None):
     parser.add_argument('--html-file', type=Path, required=True)
     parser.add_argument('--url', required=True, help='URL halaman yang diamati')
     parser.add_argument('--initial-url', default=None, help='URL .id awal sebelum redirect')
+    parser.add_argument('--v12', action='store_true',
+                        help='Offline opt-in: inspect extended v12 credential-form indicators')
     args = parser.parse_args(argv)
     with args.html_file.open('r', encoding='utf-8', errors='replace') as f:
         html = f.read(MAX_HTML_CHARS + 1)
-    print(json.dumps(inspect_html(html, args.url, args.initial_url),
-                     ensure_ascii=False, sort_keys=True, indent=2))
+    triage = inspect_html(html, args.url, args.initial_url)
+    if args.v12:
+        from phishing_signals_v12 import extend_triage
+        triage = extend_triage(triage, html, args.url, args.initial_url)
+    print(json.dumps(triage, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
 
