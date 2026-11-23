@@ -37,3 +37,19 @@ tmp/
 # Recovery archives and legacy backup
 crawler_url_june_backup.py
 crawler_production_recovered*.sqlite3
+
+# BIMA NFS runtime paths (ignore directories AND symlinks)
+# Keep these without trailing slashes: Git must ignore NFS symlink paths.
+/models
+/logs
+/multi/state
+/urls.json
+/urls.json.next
+/domains.json
+
+# Local environment, downloads, and interrupted patch artifacts
+/.venv
+.DS_Store
+*.rej
+*.orig
+*.apk
